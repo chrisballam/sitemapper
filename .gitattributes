@@ -1,0 +1,5 @@
+# Keep everything LF in the repo — this is a Unix-oriented CLI tool with
+# shebang, crontab, and systemd examples that must not carry CRLF.
+* text=auto eol=lf
+*.png binary
+*.gz binary
