@@ -366,9 +366,9 @@ class RobotsTests(unittest.TestCase):
         return r
 
     def test_mid_path_wildcard_blocks(self):
-        r = self.rules("User-agent: *\nDisallow: /photos/album/*/photo/\n")
-        self.assertFalse(r.allowed("Sitemapper", "/photos/album/467/photo/1/"))
-        self.assertTrue(r.allowed("Sitemapper", "/photos/album/467/"))
+        r = self.rules("User-agent: *\nDisallow: /gallery/*/photo/\n")
+        self.assertFalse(r.allowed("Sitemapper", "/gallery/123/photo/1/"))
+        self.assertTrue(r.allowed("Sitemapper", "/gallery/123/"))
 
     def test_prefix_disallow(self):
         r = self.rules("User-agent: *\nDisallow: /private/\n")
