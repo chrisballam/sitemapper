@@ -22,13 +22,13 @@ import gzip
 import hashlib
 import json
 import logging
+import re
 import sys
 import time
 from collections import deque
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
-from urllib import robotparser
 from urllib.error import HTTPError, URLError
 from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -271,6 +271,94 @@ class StateCache:
 
 
 # --------------------------------------------------------------------------- #
+# robots.txt (self-contained; deterministic across Python versions)
+# --------------------------------------------------------------------------- #
+# NOTE: we deliberately do NOT use urllib.robotparser. Some Python builds
+# percent-encode '*' in Allow/Disallow paths (storing "/a/%2A/b" instead of
+# "/a/*/b"), which silently breaks wildcard rules and lets a crawler fetch paths
+# the site disallowed. This implements the widely-supported '*' / '$' wildcard
+# semantics with longest-match-wins and Allow-beats-Disallow on ties.
+class RobotsRules:
+    def __init__(self):
+        # list of groups: {"agents": set[str], "rules": [(allow, pat, rx, length)],
+        #                   "delay": float|None}
+        self.groups = []
+
+    @staticmethod
+    def _compile(pattern):
+        end_anchor = pattern.endswith("$")
+        core = pattern[:-1] if end_anchor else pattern
+        out = ["^"]
+        for ch in core:
+            out.append(".*" if ch == "*" else re.escape(ch))
+        if end_anchor:
+            out.append("$")
+        return re.compile("".join(out))
+
+    def parse(self, lines):
+        cur = None
+        last_was_rule = False
+        for raw in lines:
+            line = raw.split("#", 1)[0].strip()
+            if not line or ":" not in line:
+                continue
+            field, _, val = line.partition(":")
+            field = field.strip().lower()
+            val = val.strip()
+            if field == "user-agent":
+                if cur is None or last_was_rule:
+                    cur = {"agents": set(), "rules": [], "delay": None}
+                    self.groups.append(cur)
+                    last_was_rule = False
+                cur["agents"].add(val.lower())
+            elif field in ("allow", "disallow"):
+                if cur is None:
+                    continue
+                last_was_rule = True
+                if val == "":
+                    continue  # empty Disallow = allow all; empty Allow = no-op
+                cur["rules"].append((field == "allow", val,
+                                     self._compile(val), len(val.rstrip("$"))))
+            elif field == "crawl-delay":
+                if cur is not None:
+                    last_was_rule = True
+                    try:
+                        cur["delay"] = float(val)
+                    except ValueError:
+                        pass
+
+    def _select(self, agent):
+        agent = agent.lower()
+        star = None
+        best_sub = None
+        best_len = -1
+        for g in self.groups:
+            if agent in g["agents"]:
+                return g
+            for a in g["agents"]:
+                if a == "*":
+                    star = g
+                elif a and a in agent and len(a) > best_len:
+                    best_sub, best_len = g, len(a)
+        return best_sub or star
+
+    def allowed(self, agent, path):
+        g = self._select(agent)
+        if g is None:
+            return True
+        best_len, best_allow = -1, True
+        for allow, _pat, rx, length in g["rules"]:
+            if rx.match(path) and (length > best_len
+                                   or (length == best_len and allow and not best_allow)):
+                best_len, best_allow = length, allow
+        return True if best_len == -1 else best_allow
+
+    def crawl_delay(self, agent):
+        g = self._select(agent)
+        return g["delay"] if g else None
+
+
+# --------------------------------------------------------------------------- #
 # Crawler
 # --------------------------------------------------------------------------- #
 class Crawler:
@@ -292,23 +380,29 @@ class Crawler:
 
     # ---- robots -----------------------------------------------------------
     def _load_robots(self):
-        rp = robotparser.RobotFileParser()
+        rules = RobotsRules()
         robots_url = urljoin(self.root, "/robots.txt")
         res = fetch(robots_url, self.user_agent, self.args.timeout, 1_000_000)
         if res.status == 200 and res.body:
-            rp.parse(res.body.decode("utf-8", "replace").splitlines())
+            rules.parse(res.body.decode("utf-8", "replace").splitlines())
             log.info("loaded robots.txt (%d bytes)", len(res.body))
         else:
             # No robots.txt => everything allowed (protocol default).
-            rp.parse([])
             log.info("no robots.txt found (status %s); allowing all", res.status)
-        return rp
+        return rules
+
+    @staticmethod
+    def _path_for_match(url: str) -> str:
+        parts = urlsplit(url)
+        path = parts.path or "/"
+        return path + ("?" + parts.query if parts.query else "")
 
     def _allowed(self, url: str) -> bool:
         if not self.args.respect_robots:
             return True
         try:
-            return self.robots.can_fetch(self.args.robots_agent, url)
+            return self.robots.allowed(self.args.robots_agent,
+                                       self._path_for_match(url))
         except Exception:
             return True
 
@@ -342,6 +436,9 @@ class Crawler:
 
             res = fetch(url, self.user_agent, self.args.timeout, self.args.max_bytes)
             pages += 1
+            if self.args.progress and pages % self.args.progress == 0:
+                log.info("progress: fetched=%d included=%d queued=%d",
+                         pages, len(self.included), len(queue))
             if delay:
                 time.sleep(delay)
 
@@ -420,6 +517,12 @@ class Crawler:
             if not same_scope(nxt, self.root_host, self.args.include_subdomains):
                 continue
             self.seen.add(nxt)
+            # Skip robots-disallowed links before they enter the frontier, so a
+            # disallowed section (e.g. millions of gallery pages) can't bloat the
+            # queue. The root is still checked at pop time.
+            if not self._allowed(nxt):
+                self._skip("robots-disallowed")
+                continue
             queue.append((nxt, depth + 1))
 
     def _include(self, url: str, res: FetchResult) -> None:
@@ -566,6 +669,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-respect-robots", dest="respect_robots",
                    action="store_false", default=True,
                    help="Crawl even paths robots.txt disallows (your own site only)")
+    p.add_argument("--progress", type=int, default=25,
+                   help="Log a progress line every N pages (0 = off)")
     p.add_argument("-v", "--verbose", action="count", default=0,
                    help="-v info, -vv debug")
     p.add_argument("--version", action="version", version="%(prog)s " + __version__)
@@ -584,7 +689,7 @@ def apply_config(args, parser) -> None:
     sec = cp["sitemapper"]
     bools = {"include_subdomains", "include_docs", "ignore_query", "render_js",
              "gzip", "respect_robots"}
-    ints = {"max_pages", "max_depth", "max_bytes"}
+    ints = {"max_pages", "max_depth", "max_bytes", "progress"}
     floats = {"timeout", "delay"}
     for key in sec:
         attr = key.replace("-", "_")
@@ -626,7 +731,7 @@ def main(argv=None) -> int:
 
     elapsed = time.time() - started
     skip_summary = ", ".join("%s=%d" % (k, v) for k, v in sorted(crawler.skips.items()))
-    log.warning("done: %d URLs in sitemap, %d fetched, %.1fs. skipped: %s",
+    log.warning("done: %d URLs in sitemap, %d discovered, %.1fs. skipped: %s",
                 len(urls), len(crawler.seen), elapsed, skip_summary or "none")
     for w in written:
         log.warning("wrote %s", w)

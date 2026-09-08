@@ -85,6 +85,7 @@ class Args:
         self.render_js = False
         self.respect_robots = True
         self.state = None
+        self.progress = 0
 
 
 class CrawlTests(unittest.TestCase):
@@ -183,6 +184,51 @@ class UnitTests(unittest.TestCase):
         xml = sitemapper.build_urlset([("https://e.com/?a=1&b=2", None)])
         self.assertIn("&amp;", xml)
         self.assertNotIn("a=1&b=2", xml)
+
+
+class RobotsTests(unittest.TestCase):
+    """Guards the reason we dropped urllib.robotparser: wildcard rules must
+    match regardless of Python version (some builds encode '*' as %2A)."""
+
+    def rules(self, text):
+        r = sitemapper.RobotsRules()
+        r.parse(text.splitlines())
+        return r
+
+    def test_mid_path_wildcard_blocks(self):
+        r = self.rules("User-agent: *\nDisallow: /photos/album/*/photo/\n")
+        self.assertFalse(r.allowed("Sitemapper", "/photos/album/467/photo/1/"))
+        self.assertTrue(r.allowed("Sitemapper", "/photos/album/467/"))
+
+    def test_prefix_disallow(self):
+        r = self.rules("User-agent: *\nDisallow: /private/\n")
+        self.assertFalse(r.allowed("Bot", "/private/x"))
+        self.assertTrue(r.allowed("Bot", "/public/x"))
+
+    def test_allow_overrides_longer_match(self):
+        r = self.rules("User-agent: *\nDisallow: /a/\nAllow: /a/keep/\n")
+        self.assertTrue(r.allowed("Bot", "/a/keep/page"))
+        self.assertFalse(r.allowed("Bot", "/a/other"))
+
+    def test_end_anchor(self):
+        r = self.rules("User-agent: *\nDisallow: /*.pdf$\n")
+        self.assertFalse(r.allowed("Bot", "/files/x.pdf"))
+        self.assertTrue(r.allowed("Bot", "/files/x.pdf?v=1"))
+
+    def test_empty_disallow_allows_all(self):
+        r = self.rules("User-agent: *\nDisallow:\n")
+        self.assertTrue(r.allowed("Bot", "/anything"))
+
+    def test_specific_group_beats_star(self):
+        r = self.rules("User-agent: *\nDisallow: /\n\n"
+                       "User-agent: Sitemapper\nDisallow: /secret/\n")
+        self.assertTrue(r.allowed("Sitemapper", "/public"))
+        self.assertFalse(r.allowed("Sitemapper", "/secret/x"))
+        self.assertFalse(r.allowed("OtherBot", "/public"))
+
+    def test_crawl_delay(self):
+        r = self.rules("User-agent: *\nCrawl-delay: 2.5\n")
+        self.assertEqual(r.crawl_delay("Bot"), 2.5)
 
 
 if __name__ == "__main__":
