@@ -684,7 +684,37 @@ def write_output(urls, args, root) -> list[str]:
     return written
 
 
-def write_reports(crawler, report_dir: str) -> dict:
+# File extensions treated as non-HTML resources for the crawlable-only filter.
+NON_HTML_EXTS = {
+    "pdf", "jpg", "jpeg", "png", "gif", "svg", "webp", "avif", "ico", "bmp",
+    "tif", "tiff", "css", "js", "mjs", "json", "xml", "rss", "atom", "txt",
+    "csv", "zip", "gz", "tgz", "tar", "rar", "7z", "mp4", "webm", "mov", "avi",
+    "mkv", "mp3", "wav", "ogg", "flac", "m4a", "doc", "docx", "xls", "xlsx",
+    "ppt", "pptx", "woff", "woff2", "ttf", "eot", "otf", "dmg", "exe", "apk",
+    "iso", "wasm", "map",
+}
+
+
+def _looks_non_html(url: str) -> bool:
+    """True if the URL path ends in a known non-HTML file extension."""
+    last = urlsplit(url).path.rsplit("/", 1)[-1]
+    if "." not in last:
+        return False
+    return last.rsplit(".", 1)[-1].lower() in NON_HTML_EXTS
+
+
+def _report_keep(crawler, target: str, internal: bool) -> bool:
+    """Filter used when --report-crawlable-only is set: keep only HTML targets
+    that robots.txt would let a crawler fetch (robots only applies to internal
+    targets on your own domain)."""
+    if _looks_non_html(target):
+        return False
+    if internal and not crawler._allowed(target):
+        return False
+    return True
+
+
+def write_reports(crawler, report_dir: str, crawlable_only: bool = False) -> dict:
     """Write broken-links.csv, internal-links.csv, external-links.csv.
 
     - broken-links.csv: one row per (broken URL, referring page). "Broken" is any
@@ -695,8 +725,13 @@ def write_reports(crawler, report_dir: str) -> dict:
       registrable domain.
     """
     os.makedirs(report_dir, exist_ok=True)
-    counts = {"broken": 0, "internal": len(crawler.internal_edges),
-              "external": len(crawler.external_edges)}
+
+    internal = crawler.internal_edges
+    external = crawler.external_edges
+    if crawlable_only:
+        internal = {(s, t) for s, t in internal if _report_keep(crawler, t, True)}
+        external = {(s, t) for s, t in external if _report_keep(crawler, t, False)}
+    counts = {"broken": 0, "internal": len(internal), "external": len(external)}
 
     broken = sorted((u, s) for u, s in crawler.fetch_status.items()
                     if s == 0 or s >= 400)
@@ -711,8 +746,8 @@ def write_reports(crawler, report_dir: str) -> dict:
             for r in refs:
                 w.writerow([u, status, r])
 
-    for name, edges in (("internal-links.csv", crawler.internal_edges),
-                        ("external-links.csv", crawler.external_edges)):
+    for name, edges in (("internal-links.csv", internal),
+                        ("external-links.csv", external)):
         with open(os.path.join(report_dir, name), "w", newline="",
                   encoding="utf-8") as fh:
             w = csv.writer(fh)
@@ -769,6 +804,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--report-dir", default=None,
                    help="Also write broken-links.csv, internal-links.csv and "
                         "external-links.csv into this directory")
+    p.add_argument("--report-crawlable-only", action="store_true",
+                   help="In the internal/external link reports, keep only HTML "
+                        "targets a crawler could fetch: drop robots-disallowed "
+                        "targets and non-HTML files (PDF/image/JS/...). "
+                        "broken-links.csv is never filtered.")
     p.add_argument("--render-js", action="store_true",
                    help="Render pages with Playwright to find JS-injected links "
                         "(optional; requires `pip install playwright`)")
@@ -798,7 +838,7 @@ def apply_config(args, parser) -> None:
         return
     sec = cp["sitemapper"]
     bools = {"include_subdomains", "include_docs", "ignore_query", "render_js",
-             "gzip", "respect_robots", "no_strip_params"}
+             "gzip", "respect_robots", "no_strip_params", "report_crawlable_only"}
     ints = {"max_pages", "max_depth", "max_bytes", "progress"}
     floats = {"timeout", "delay"}
     for key in sec:
@@ -847,7 +887,7 @@ def main(argv=None) -> int:
         log.warning("wrote %s", w)
 
     if args.report_dir is not None:
-        c = write_reports(crawler, args.report_dir)
+        c = write_reports(crawler, args.report_dir, args.report_crawlable_only)
         log.warning("reports: %d broken link(s), %d internal, %d external -> %s",
                     c["broken"], c["internal"], c["external"], args.report_dir)
 

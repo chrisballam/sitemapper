@@ -30,6 +30,7 @@ PAGES = {
         <a href="/dup?sid=1">Dup</a>
         <a href="/resume.pdf">Resume</a>
         <a href="https://other.example.org/x">External</a>
+        <a href="https://cdn.example.net/logo.png">ExtImg</a>
         <a href="/nofollow-target" rel="nofollow">NF</a>
         <a href="/missing">Broken</a>
         </body></html>"""),
@@ -91,6 +92,7 @@ class Args:
         self.strip_params = ",".join(sorted(sitemapper.DEFAULT_STRIP_PARAMS))
         self.no_strip_params = False
         self.report_dir = None
+        self.report_crawlable_only = False
 
 
 class CrawlTests(unittest.TestCase):
@@ -252,6 +254,29 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(any("/about" in u for u in internal))
         self.assertIn("https://other.example.org/x", external)
         self.assertFalse(any("other.example.org" in u for u in internal))
+
+    def test_crawlable_only_filter(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        args = Args(self.base + "/")
+        args.report_dir = d
+        args.report_crawlable_only = True
+        c = sitemapper.Crawler(args.url, args)
+        c.run()
+        sitemapper.write_reports(c, d, crawlable_only=True)
+        with open(os.path.join(d, "internal-links.csv"), newline="") as fh:
+            internal = {r["target_url"] for r in csv.DictReader(fh)}
+        with open(os.path.join(d, "external-links.csv"), newline="") as fh:
+            external = {r["target_url"] for r in csv.DictReader(fh)}
+        # robots-disallowed internal target dropped
+        self.assertFalse(any(u.endswith("/private/secret") for u in internal))
+        # non-HTML internal target (PDF) dropped
+        self.assertFalse(any(u.endswith("/resume.pdf") for u in internal))
+        # HTML internal target kept
+        self.assertTrue(any(u.endswith("/about") for u in internal))
+        # non-HTML external (png) dropped; HTML external kept
+        self.assertFalse(any("logo.png" in u for u in external))
+        self.assertIn("https://other.example.org/x", external)
 
 
 class RobotsTests(unittest.TestCase):

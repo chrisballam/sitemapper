@@ -73,6 +73,7 @@ Sitemap: https://example.com/sitemap.xml
 | `--include-subdomains` | Also crawl subdomains of the registrable domain |
 | `--no-docs` | HTML pages only; exclude PDFs (PDFs are included by default) |
 | `--report-dir DIR` | Also write `broken-links.csv`, `internal-links.csv`, `external-links.csv` |
+| `--report-crawlable-only` | In the link reports, keep only HTML page targets (drop robots-disallowed + non-HTML files) |
 | `--ignore-query` | Drop the **entire** query string (opt-in; see [Query strings](#query-strings)) |
 | `--strip-params LIST` | Query params to drop as tracking junk (default list; `utm_*` always dropped) |
 | `--no-strip-params` | Keep every query param, including tracking ones |
@@ -104,11 +105,29 @@ python sitemapper.py https://example.com --report-dir ./reports
 - **`external-links.csv`** — every link that points to a third-party domain
   (social profiles, references, etc.). Columns: `source_page, target_url`.
 
+Add **`--report-crawlable-only`** to trim the internal/external reports down to
+real HTML page targets — it drops:
+- **robots-disallowed** targets (e.g. a gallery's per-photo URLs your `robots.txt`
+  blocks), and
+- **non-HTML files** by extension (`.pdf`, images, `.js`, `.css`, archives, media…).
+
+`broken-links.csv` is **never** filtered — a dead PDF or blocked URL is still worth
+knowing about.
+
+```bash
+# Full edge list (everything linked)
+python sitemapper.py https://example.com --report-dir ./reports
+
+# Just the HTML page-to-page graph
+python sitemapper.py https://example.com --report-dir ./reports --report-crawlable-only
+```
+
 Notes:
 - Broken-link detection covers **internal** URLs the crawler actually fetched;
   it does not fetch external URLs, so it won't flag a dead third-party link.
-- On very large sites `internal-links.csv` can be big — it's a full edge list
-  (every link on every crawled page), which is what makes it actionable.
+- Without `--report-crawlable-only`, `internal-links.csv` is a *full* edge list
+  (every link on every crawled page) and can be large on big sites — that's what
+  makes it complete. Use the flag for an actionable page-graph.
 - Collection only happens when `--report-dir` is set, so normal runs stay lean.
 
 ### Query strings
