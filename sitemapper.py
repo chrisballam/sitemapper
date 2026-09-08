@@ -933,10 +933,15 @@ CRON_SCHEDULES = {"daily": "15 3 * * *",
 
 
 def cron_line(args) -> str:
-    """Build a crontab line reproducing the essential flags of this invocation."""
-    py = sys.executable or "/usr/bin/python3"
-    script = os.path.abspath(__file__)
-    cmd = [py, script, args.url or "https://example.com"]
+    """Build a crontab line reproducing the essential flags of this invocation.
+    Emits the installed `sitemapper` command when run as a console script, or
+    `python /abs/sitemapper.py` when run as the single file."""
+    prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+    if prog.startswith("sitemapper") and not prog.endswith(".py"):
+        cmd = ["sitemapper", args.url or "https://example.com"]
+    else:
+        py = sys.executable or "/usr/bin/python3"
+        cmd = [py, os.path.abspath(__file__), args.url or "https://example.com"]
     if args.output:
         cmd += ["-o", args.output]
     if args.state:
