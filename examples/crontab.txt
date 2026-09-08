@@ -23,3 +23,7 @@
 # To also notify Bing/Yandex/etc of changed pages, add --indexnow <key> (after
 # hosting https://example.com/<key>.txt). Google does not use IndexNow and no
 # longer needs a sitemap ping.
+#
+# To also save the broken/internal/external link CSVs, add --report-dir pointing
+# at a PRIVATE directory OUTSIDE your webroot (the sitemap still goes to -o):
+#   ... -o /var/www/example.com/sitemap.xml --report-dir /var/log/sitemapper/reports

@@ -107,11 +107,28 @@ Full list: `python sitemapper.py --help`.
 
 ### Link reports (broken / internal / external)
 
-Pass `--report-dir DIR` to also emit three CSVs alongside the sitemap:
+Pass `--report-dir DIR` to also emit three CSVs into `DIR`:
 
 ```bash
 python sitemapper.py https://example.com --report-dir ./reports
 ```
+
+> ⚠️ **Keep `--report-dir` OUTSIDE your public webroot.** These CSVs are for you,
+> not your visitors — they list your internal link graph and any broken URLs, and
+> you almost certainly don't want them fetchable on your live site. `--report-dir`
+> is **independent** of `--output`: the sitemap goes where `-o` points (e.g. your
+> webroot) while the reports go wherever `--report-dir` points. So you can, and
+> should, write the sitemap to the webroot and the CSVs to a private directory:
+>
+> ```bash
+> python sitemapper.py https://example.com \
+>   -o /var/www/example.com/sitemap.xml \      # public: served at your root
+>   --report-dir /var/log/sitemapper/reports    # private: outside the webroot
+> ```
+>
+> Good spots for `--report-dir`: `/var/log/sitemapper/…`, `/var/lib/sitemapper/…`,
+> or a folder in your home directory — anywhere your web server does **not** serve.
+> If you omit `--report-dir`, no CSVs are written at all.
 
 - **`broken-links.csv`** — every URL that failed to load (HTTP 4xx/5xx or a
   connection error), **with the page(s) that link to it**. Columns:
