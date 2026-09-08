@@ -223,6 +223,13 @@ python -m unittest discover -s tests -v
 The tests run a local HTTP server with fixtures and assert the inclusion/exclusion
 rules (noindex, canonical, redirects, robots, PDFs, scope).
 
+## Crawl responsibly
+
+Run sitemapper against sites you own or have permission to crawl. It respects
+`robots.txt` by default, identifies itself with a descriptive User-Agent, honors
+`Crawl-delay`, and offers `--delay` / `--max-pages` to stay polite on large or
+shared hosts. `--no-respect-robots` exists for your *own* site only.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

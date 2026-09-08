@@ -87,10 +87,12 @@ def normalize_url(url: str, base: str | None = None, ignore_query: bool = False,
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):
         return None
-    host = parts.hostname or ""
-    host = host.lower()
-    # Drop the default port for the scheme.
-    port = parts.port
+    host = (parts.hostname or "").lower()
+    # Guard against a malformed port (parts.port raises ValueError on junk).
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
     if port is not None and not (
         (parts.scheme == "http" and port == 80)
         or (parts.scheme == "https" and port == 443)
@@ -98,9 +100,8 @@ def normalize_url(url: str, base: str | None = None, ignore_query: bool = False,
         netloc = "%s:%d" % (host, port)
     else:
         netloc = host
-    if parts.username:  # preserve credentials if unusually present
-        userinfo = parts.username + ((":" + parts.password) if parts.password else "")
-        netloc = "%s@%s" % (userinfo, netloc)
+    # Deliberately drop any "user:pass@" userinfo — credentials must never appear
+    # in a sitemap or a link report.
     path = parts.path or "/"
     if ignore_query:
         query = ""
