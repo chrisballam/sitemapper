@@ -16,4 +16,6 @@ Type=oneshot
 ExecStart=/usr/bin/python3 /opt/sitemapper/sitemapper.py https://example.com \
   -o /var/www/example.com/sitemap.xml \
   --state /var/lib/sitemapper/example.state.json
+# To notify Bing/Yandex/etc of changed pages, append (host <key>.txt first):
+#   --indexnow ab12cd0000000000000000000000000000
 Nice=10

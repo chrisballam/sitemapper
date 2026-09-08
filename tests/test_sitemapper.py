@@ -5,10 +5,14 @@ asserts which URLs land in the sitemap and why the others are excluded.
 """
 
 import csv
+import hashlib
+import json
 import os
 import sys
 import threading
+import types
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -93,6 +97,12 @@ class Args:
         self.no_strip_params = False
         self.report_dir = None
         self.report_crawlable_only = False
+        self.indexnow = None
+        self.indexnow_key_location = None
+        self.indexnow_endpoint = "https://api.indexnow.org/indexnow"
+        self.print_cron = None
+        self.gzip = False
+        self.output = None
 
 
 class CrawlTests(unittest.TestCase):
@@ -277,6 +287,73 @@ class ReportTests(unittest.TestCase):
         # non-HTML external (png) dropped; HTML external kept
         self.assertFalse(any("logo.png" in u for u in external))
         self.assertIn("https://other.example.org/x", external)
+
+
+class FeatureTests(unittest.TestCase):
+    """cron printer, IndexNow submission, state-change tracking, atomic write."""
+
+    def test_cron_line(self):
+        ns = types.SimpleNamespace(
+            url="https://e.com", output="/var/www/e/sitemap.xml",
+            state="/var/lib/e.json", indexnow="KEY", gzip=False,
+            print_cron="weekly")
+        line = sitemapper.cron_line(ns)
+        self.assertTrue(line.startswith("15 3 * * 1"))
+        self.assertIn("https://e.com", line)
+        self.assertIn("--state", line)
+        self.assertIn("--indexnow", line)
+        self.assertIn(">> /var/log/sitemapper.log 2>&1", line)
+
+    def test_state_change_tracking(self):
+        sc = sitemapper.StateCache(None)
+        sc.data = {"u": {"hash": hashlib.sha256(b"x").hexdigest(),
+                         "lastmod": "2026-01-01"}}
+        # unchanged content -> keeps old lastmod, NOT flagged changed
+        self.assertEqual(sc.lastmod_for("u", b"x", None, "2026-09-08"), "2026-01-01")
+        self.assertNotIn("u", sc.changed)
+        # new content -> today's date + flagged changed
+        self.assertEqual(sc.lastmod_for("v", b"y", None, "2026-09-08"), "2026-09-08")
+        self.assertIn("v", sc.changed)
+
+    def test_indexnow_payload(self):
+        captured = {}
+
+        class FakeResp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def getcode(self): return 200
+
+        def fake_urlopen(req, timeout=None):
+            captured["data"] = req.data
+            captured["url"] = req.full_url
+            return FakeResp()
+
+        with mock.patch.object(sitemapper, "urlopen", fake_urlopen):
+            code = sitemapper.submit_indexnow(
+                "example.com", "KEY123", ["https://example.com/a"],
+                "https://example.com/KEY123.txt")
+        self.assertEqual(code, 200)
+        body = json.loads(captured["data"])
+        self.assertEqual(body["host"], "example.com")
+        self.assertEqual(body["key"], "KEY123")
+        self.assertIn("https://example.com/a", body["urlList"])
+        self.assertTrue(body["keyLocation"].endswith("KEY123.txt"))
+
+    def test_indexnow_empty_is_noop(self):
+        # No URLs -> no request attempted, returns None.
+        with mock.patch.object(sitemapper, "urlopen",
+                               side_effect=AssertionError("should not POST")):
+            self.assertIsNone(sitemapper.submit_indexnow("e.com", "K", []))
+
+    def test_atomic_write_leaves_no_tmp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "sitemap.xml")
+        sitemapper.write_text(p, "<x/>", False)
+        with open(p, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "<x/>")
+        self.assertEqual([f for f in os.listdir(d) if ".tmp" in f], [])
 
 
 class RobotsTests(unittest.TestCase):

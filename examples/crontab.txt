@@ -15,3 +15,11 @@
 
 # Find your python path with:  command -v python3
 # Test the command by running it once by hand before trusting the schedule.
+#
+# Tip: let sitemapper write this line for you (fills in absolute paths):
+#   python sitemapper.py https://example.com -o /var/www/example.com/sitemap.xml \
+#     --state /var/lib/sitemapper/example.state.json --print-cron daily
+#
+# To also notify Bing/Yandex/etc of changed pages, add --indexnow <key> (after
+# hosting https://example.com/<key>.txt). Google does not use IndexNow and no
+# longer needs a sitemap ping.

@@ -35,14 +35,25 @@ It also produces **honest `<lastmod>`**:
 
 ## Install
 
+**Option A — install as a command (recommended for servers):**
+
+```bash
+pipx install git+https://github.com/chrisballam/sitemapper.git
+sitemapper --help          # now on your PATH
+```
+
+(`pip install --user git+https://github.com/chrisballam/sitemapper.git` works too.)
+
+**Option B — no install, just the single file:**
+
 ```bash
 git clone https://github.com/chrisballam/sitemapper.git
 cd sitemapper
-# no build step, no pip install needed
-python sitemapper.py --help
+python sitemapper.py --help   # no build step, no dependencies
 ```
 
-(Optionally copy `sitemapper.py` anywhere on your `PATH` and `chmod +x` it.)
+Either way the core needs only the Python 3.8+ standard library. Examples below
+show `python sitemapper.py …`; if you installed via Option A, use `sitemapper …`.
 
 ## Usage
 
@@ -64,6 +75,12 @@ Then place the resulting `sitemap.xml` at the **root** of your site
 Sitemap: https://example.com/sitemap.xml
 ```
 
+**Writing straight to your webroot is supported and safe.** Point `--output` at
+the served path (e.g. `-o /var/www/example.com/sitemap.xml`); the file is written
+**atomically** (to a temp file, then `os.replace`), so a crawler requesting the
+sitemap mid-run never sees a half-written file. Just make sure the user running
+the command can write to that directory.
+
 ### Common options
 
 | Flag | Purpose |
@@ -81,6 +98,8 @@ Sitemap: https://example.com/sitemap.xml
 | `--delay SECONDS` | Politeness delay between requests (defaults to robots `Crawl-delay`) |
 | `--max-pages N` | Safety cap on pages fetched (`0` = unlimited; default 50000) |
 | `--render-js` | Render pages with Playwright to find JS-injected links (see below) |
+| `--indexnow KEY` | After writing, submit changed URLs to IndexNow (Bing/Yandex/…) |
+| `--print-cron daily\|weekly\|monthly` | Print a ready crontab line for this invocation and exit |
 | `--config FILE` | Load defaults from an INI file (see `examples/config.example.ini`) |
 | `-v`, `-vv` | Info / debug logging |
 
@@ -179,34 +198,70 @@ python sitemapper.py https://spa.example.com --render-js
 If Playwright isn't installed, `--render-js` logs a warning and falls back to
 static HTML — it never hard-fails.
 
-## Automating with cron
+## Notifying search engines
 
-Generate a fresh sitemap on a schedule. Edit your crontab with `crontab -e` and
-add one line (see `examples/crontab.txt` for more):
+Once a fresh `sitemap.xml` is live at your root, engines pick it up on their own —
+you rarely need to "ping" anyone:
 
-```cron
-# Daily at 03:15 — regenerate and keep an honest lastmod cache
-15 3 * * * /usr/bin/python3 /opt/sitemapper/sitemapper.py https://example.com \
+- **Reference it in `robots.txt`** — `Sitemap: https://example.com/sitemap.xml`.
+  This is the durable, one-time step every crawler honors.
+- **Submit it once** in Google Search Console and Bing Webmaster Tools. After
+  that they recrawl the same URL automatically.
+- **No Google/Bing ping option, on purpose.** The old `google.com/ping?sitemap=`
+  and `bing.com/ping?sitemap=` endpoints were **retired** (Google in 2023, Bing in
+  2023). A tool that "pinged" them would be doing nothing. This isn't an omission —
+  those features are dead.
+
+**For fast re-indexing of changed pages, use IndexNow** (Bing, Yandex, Seznam,
+Naver — Google does not participate). sitemapper can submit **only the URLs whose
+content changed this run** (it knows them from the `--state` cache):
+
+```bash
+# One-time: host your key file at the site root, e.g.
+#   https://example.com/ab12cd….txt  containing the single line  ab12cd…
+python sitemapper.py https://example.com \
   -o /var/www/example.com/sitemap.xml \
-  --state /var/lib/sitemapper/example.state.json >> /var/log/sitemapper.log 2>&1
+  --state /var/lib/sitemapper/example.state.json \
+  --indexnow ab12cd…
 ```
 
-Schedule cheatsheet (the five fields are `minute hour day-of-month month day-of-week`):
+On each run it POSTs the changed URLs to IndexNow and logs the result. With
+`--state`, an unchanged site submits nothing; without it, every indexable URL is
+treated as new. Override the key location or endpoint with
+`--indexnow-key-location` / `--indexnow-endpoint`.
 
-| Frequency | Schedule line prefix |
-|-----------|----------------------|
-| Every day at 03:15 | `15 3 * * *` |
-| Every Monday at 03:15 | `15 3 * * 1` |
-| 1st of each month at 03:15 | `15 3 1 * *` |
+## Automating with cron
+
+Let sitemapper write the crontab line for you — pick a frequency and paste the
+output into `crontab -e`:
+
+```bash
+python sitemapper.py https://example.com \
+  -o /var/www/example.com/sitemap.xml \
+  --state /var/lib/sitemapper/example.state.json \
+  --indexnow ab12cd… \
+  --print-cron daily
+```
+
+That prints, e.g.:
+
+```cron
+15 3 * * * /usr/bin/python3 /opt/sitemapper/sitemapper.py https://example.com -o /var/www/example.com/sitemap.xml --state /var/lib/sitemapper/example.state.json --indexnow ab12cd… >> /var/log/sitemapper.log 2>&1
+```
+
+`--print-cron` accepts `daily` (03:15), `weekly` (Mondays 03:15), or `monthly`
+(1st, 03:15); it only prints — it never edits your crontab. Full hand-written
+examples are in `examples/crontab.txt`, and a systemd timer + service unit in
+`examples/`.
 
 **Tips**
-- Use an **absolute** Python path and script path (cron has a minimal `PATH`).
-- Keep the same `--state` file between runs so `lastmod` reflects real changes.
-- Write the sitemap somewhere your web server already serves, or add a deploy/copy
-  step after generation.
+- Use an **absolute** Python path and script path (cron has a minimal `PATH`);
+  `--print-cron` fills these in for you. If you installed via `pipx`, replace the
+  python + script path with just `sitemapper`.
+- Keep the same `--state` file between runs so `lastmod` and `--indexnow` reflect
+  real changes.
+- The sitemap is written atomically, so pointing `-o` at your live webroot is safe.
 - Redirect output to a log (`>> …log 2>&1`) so failures are visible.
-
-Prefer systemd? See `examples/` for a timer + service unit equivalent.
 
 ## Exit codes
 

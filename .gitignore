@@ -14,3 +14,8 @@ internal-links.csv
 external-links.csv
 reports/
 .venv/
+
+# python packaging build artifacts
+build/
+dist/
+*.egg-info/

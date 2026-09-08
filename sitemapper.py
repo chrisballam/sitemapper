@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import time
 from collections import deque
@@ -37,7 +38,7 @@ from urllib.parse import (parse_qsl, urldefrag, urlencode, urljoin, urlsplit,
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Query params dropped during URL normalization by default: pure click/tracking
 # junk that never identifies a distinct page. Any `utm_*` param is also dropped.
@@ -273,6 +274,7 @@ class StateCache:
     def __init__(self, path: str | None):
         self.path = path
         self.data: dict[str, dict] = {}
+        self.changed: set = set()  # URLs new or content-changed this run
         if path:
             try:
                 with open(path, "r", encoding="utf-8") as fh:
@@ -282,12 +284,17 @@ class StateCache:
 
     def lastmod_for(self, url: str, body: bytes, header_lm: datetime | None,
                     today: str) -> str | None:
-        if header_lm is not None:
-            return header_lm.astimezone(timezone.utc).date().isoformat()
-        digest = hashlib.sha256(body).hexdigest()
         prev = self.data.get(url)
+        if header_lm is not None:
+            d = header_lm.astimezone(timezone.utc).date().isoformat()
+            if not prev or prev.get("lastmod") != d:
+                self.changed.add(url)
+            self.data[url] = {"lastmod": d}
+            return d
+        digest = hashlib.sha256(body).hexdigest()
         if prev and prev.get("hash") == digest:
             return prev.get("lastmod")
+        self.changed.add(url)
         self.data[url] = {"hash": digest, "lastmod": today}
         return today
 
@@ -647,13 +654,27 @@ def chunk_urls(urls, max_urls=MAX_URLS_PER_FILE, max_bytes=MAX_BYTES_PER_FILE):
 
 
 def write_text(path: str, text: str, do_gzip: bool) -> None:
+    """Write atomically: build a temp file next to the target, then os.replace it
+    into place. A crawler fetching the live sitemap never sees a partial file —
+    important when --output points straight at a served webroot."""
+    if os.path.basename(path).lower() in ("null", "nul") or path == "/dev/null":
+        return  # discard sink
     data = text.encode("utf-8")
-    if do_gzip:
-        with gzip.open(path, "wb") as fh:
-            fh.write(data)
-    else:
-        with open(path, "wb") as fh:
-            fh.write(data)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        if do_gzip:
+            with gzip.open(tmp, "wb") as fh:
+                fh.write(data)
+        else:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def write_output(urls, args, root) -> list[str]:
@@ -759,6 +780,40 @@ def write_reports(crawler, report_dir: str, crawlable_only: bool = False) -> dic
 
 
 # --------------------------------------------------------------------------- #
+# IndexNow (Bing / Yandex / Seznam / Naver). Google does NOT participate in
+# IndexNow and retired its sitemap-ping endpoint in 2023 — there is nothing to
+# ping Google with; list the sitemap in robots.txt + Search Console instead.
+# --------------------------------------------------------------------------- #
+INDEXNOW_MAX_URLS = 10000  # per IndexNow request
+
+
+def submit_indexnow(host, key, urls, key_location=None,
+                    endpoint="https://api.indexnow.org/indexnow", timeout=20.0):
+    """POST the changed URLs to IndexNow. Returns the HTTP status code, or None
+    on a network error. The key must already be hosted at
+    https://<host>/<key>.txt (IndexNow verifies ownership that way)."""
+    urls = list(urls)[:INDEXNOW_MAX_URLS]
+    if not urls:
+        return None
+    body = {"host": host, "key": key, "urlList": urls}
+    if key_location:
+        body["keyLocation"] = key_location
+    data = json.dumps(body).encode("utf-8")
+    req = Request(endpoint, data=data, method="POST", headers={
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": DEFAULT_USER_AGENT,
+    })
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return getattr(resp, "status", resp.getcode()) or resp.getcode()
+    except HTTPError as e:
+        return e.code
+    except (URLError, TimeoutError) as e:
+        log.warning("IndexNow submit failed: %s", getattr(e, "reason", e))
+        return None
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -813,6 +868,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--render-js", action="store_true",
                    help="Render pages with Playwright to find JS-injected links "
                         "(optional; requires `pip install playwright`)")
+    p.add_argument("--indexnow", metavar="KEY",
+                   help="After writing, submit this run's changed URLs to IndexNow "
+                        "(Bing/Yandex/Seznam/Naver). KEY must be hosted at "
+                        "https://<host>/<KEY>.txt. Google does not use IndexNow. "
+                        "Best paired with --state so only changed URLs are sent.")
+    p.add_argument("--indexnow-key-location",
+                   help="Override the IndexNow key file URL "
+                        "(default https://<host>/<KEY>.txt)")
+    p.add_argument("--indexnow-endpoint",
+                   default="https://api.indexnow.org/indexnow",
+                   help="IndexNow submission endpoint")
+    p.add_argument("--print-cron", choices=("daily", "weekly", "monthly"),
+                   help="Print a ready-to-paste crontab line for this invocation "
+                        "and exit (does not crawl)")
     p.add_argument("--gzip", action="store_true", help="Write gzipped sitemap(s)")
     p.add_argument("--public-path", default="",
                    help="URL path prefix where shards will be hosted, for the "
@@ -858,10 +927,40 @@ def apply_config(args, parser) -> None:
         args.url = sec.get("url")
 
 
+CRON_SCHEDULES = {"daily": "15 3 * * *",
+                  "weekly": "15 3 * * 1",
+                  "monthly": "15 3 1 * *"}
+
+
+def cron_line(args) -> str:
+    """Build a crontab line reproducing the essential flags of this invocation."""
+    py = sys.executable or "/usr/bin/python3"
+    script = os.path.abspath(__file__)
+    cmd = [py, script, args.url or "https://example.com"]
+    if args.output:
+        cmd += ["-o", args.output]
+    if args.state:
+        cmd += ["--state", args.state]
+    if args.indexnow:
+        cmd += ["--indexnow", args.indexnow]
+    if args.gzip:
+        cmd += ["--gzip"]
+    quoted = " ".join(shlex.quote(c) for c in cmd)
+    return "%s %s >> /var/log/sitemapper.log 2>&1" % (
+        CRON_SCHEDULES[args.print_cron], quoted)
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     apply_config(args, parser)
+
+    if args.print_cron:
+        print(cron_line(args))
+        print("# ^ add with `crontab -e`. If you installed via pip/pipx, replace "
+              "the python + script path with just: sitemapper", file=sys.stderr)
+        return 0
+
     if not args.url:
         parser.error("a start URL is required (on the command line or in --config)")
 
@@ -891,6 +990,20 @@ def main(argv=None) -> int:
         c = write_reports(crawler, args.report_dir, args.report_crawlable_only)
         log.warning("reports: %d broken link(s), %d internal, %d external -> %s",
                     c["broken"], c["internal"], c["external"], args.report_dir)
+
+    if args.indexnow:
+        changed = [u for u in crawler.included if u in crawler.state.changed]
+        if changed:
+            host = urlsplit(crawler.root).hostname
+            loc = args.indexnow_key_location or (
+                "https://%s/%s.txt" % (host, args.indexnow))
+            code = submit_indexnow(host, args.indexnow, changed, loc,
+                                   args.indexnow_endpoint, args.timeout)
+            ok = code in (200, 202)
+            log.warning("IndexNow: submitted %d changed URL(s) -> HTTP %s%s",
+                        len(changed), code, "" if ok else " (not accepted)")
+        else:
+            log.warning("IndexNow: no changed URLs this run; nothing submitted")
 
     if not urls:
         log.warning("no indexable URLs found — check the start URL and robots.txt")

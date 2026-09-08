@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sitemapper"
+description = "Validated sitemap.xml generator that crawls a site, respects robots.txt, and emits only canonical, indexable URLs."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Chris Ballam" }]
+keywords = ["sitemap", "seo", "crawler", "robots.txt", "indexnow", "web"]
+dynamic = ["version"]
+dependencies = []
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Internet :: WWW/HTTP :: Site Management",
+]
+
+[project.optional-dependencies]
+# Only needed for --render-js (JavaScript-rendered sites).
+js = ["playwright>=1.30"]
+
+[project.urls]
+Homepage = "https://github.com/chrisballam/sitemapper"
+Issues = "https://github.com/chrisballam/sitemapper/issues"
+
+[project.scripts]
+sitemapper = "sitemapper:main"
+
+[tool.setuptools]
+py-modules = ["sitemapper"]
+
+[tool.setuptools.dynamic]
+version = { attr = "sitemapper.__version__" }
