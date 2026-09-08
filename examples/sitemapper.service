@@ -1,0 +1,19 @@
+# systemd service unit for sitemapper (paired with sitemapper.timer).
+# Install to /etc/systemd/system/sitemapper.service, edit the paths/URL, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sitemapper.timer
+# Run once immediately to test:  sudo systemctl start sitemapper.service
+
+[Unit]
+Description=Generate sitemap.xml for example.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Optional hardening: run as a low-privilege user that can write OUT + STATE.
+# User=www-data
+ExecStart=/usr/bin/python3 /opt/sitemapper/sitemapper.py https://example.com \
+  -o /var/www/example.com/sitemap.xml \
+  --state /var/lib/sitemapper/example.state.json
+Nice=10

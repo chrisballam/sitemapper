@@ -1,0 +1,5 @@
+# The core tool needs NOTHING here — Python 3.7+ standard library only.
+# Install these ONLY if you use --render-js for JavaScript-rendered sites:
+#   pip install -r requirements-optional.txt
+#   playwright install chromium
+playwright>=1.30

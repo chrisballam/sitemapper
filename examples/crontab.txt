@@ -1,0 +1,17 @@
+# Example crontab entries for sitemapper.
+# Install with `crontab -e`. Fields: minute hour day-of-month month day-of-week
+#
+# Use ABSOLUTE paths — cron runs with a minimal PATH — and keep the same --state
+# file between runs so <lastmod> reflects real content changes. Pick ONE line.
+
+# --- Daily at 03:15 ------------------------------------------------------
+15 3 * * * /usr/bin/python3 /opt/sitemapper/sitemapper.py https://example.com -o /var/www/example.com/sitemap.xml --state /var/lib/sitemapper/example.state.json >> /var/log/sitemapper.log 2>&1
+
+# --- Weekly, Mondays at 03:15 -------------------------------------------
+# 15 3 * * 1 /usr/bin/python3 /opt/sitemapper/sitemapper.py https://example.com -o /var/www/example.com/sitemap.xml --state /var/lib/sitemapper/example.state.json >> /var/log/sitemapper.log 2>&1
+
+# --- Monthly, 1st of the month at 03:15 ----------------------------------
+# 15 3 1 * * /usr/bin/python3 /opt/sitemapper/sitemapper.py https://example.com -o /var/www/example.com/sitemap.xml --state /var/lib/sitemapper/example.state.json >> /var/log/sitemapper.log 2>&1
+
+# Find your python path with:  command -v python3
+# Test the command by running it once by hand before trusting the schedule.

@@ -1,0 +1,19 @@
+# systemd timer unit for sitemapper (paired with sitemapper.service).
+# Install to /etc/systemd/system/sitemapper.timer, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sitemapper.timer
+# Inspect schedule:  systemctl list-timers sitemapper.timer
+
+[Unit]
+Description=Run sitemapper on a schedule
+
+[Timer]
+# Daily at 03:15. Other examples (uncomment ONE):
+OnCalendar=*-*-* 03:15:00
+# Weekly, Mondays 03:15:   OnCalendar=Mon *-*-* 03:15:00
+# Monthly, 1st at 03:15:   OnCalendar=*-*-01 03:15:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

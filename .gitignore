@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+# generated output / caches
+sitemap.xml
+sitemap.xml.gz
+sitemap-*.xml
+sitemap-*.xml.gz
+sitemap_index.xml
+*.state.json
+*.log
+.venv/
