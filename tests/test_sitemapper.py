@@ -4,6 +4,7 @@ Runs a real local HTTP server serving in-memory fixtures, crawls it, and
 asserts which URLs land in the sitemap and why the others are excluded.
 """
 
+import csv
 import os
 import sys
 import threading
@@ -30,6 +31,7 @@ PAGES = {
         <a href="/resume.pdf">Resume</a>
         <a href="https://other.example.org/x">External</a>
         <a href="/nofollow-target" rel="nofollow">NF</a>
+        <a href="/missing">Broken</a>
         </body></html>"""),
     "/about": (200, "text/html", {}, "<html><body>About us</body></html>"),
     "/page1.html": (200, "text/html", {}, "<html><body>Page one</body></html>"),
@@ -86,6 +88,9 @@ class Args:
         self.respect_robots = True
         self.state = None
         self.progress = 0
+        self.strip_params = ",".join(sorted(sitemapper.DEFAULT_STRIP_PARAMS))
+        self.no_strip_params = False
+        self.report_dir = None
 
 
 class CrawlTests(unittest.TestCase):
@@ -184,6 +189,69 @@ class UnitTests(unittest.TestCase):
         xml = sitemapper.build_urlset([("https://e.com/?a=1&b=2", None)])
         self.assertIn("&amp;", xml)
         self.assertNotIn("a=1&b=2", xml)
+
+
+class QueryParamTests(unittest.TestCase):
+    def test_strip_named_and_utm_keep_real(self):
+        sp = sitemapper.DEFAULT_STRIP_PARAMS
+        out = sitemapper.normalize_url(
+            "https://e.com/p?utm_source=fb&gclid=xyz&id=5&page=2", strip_params=sp)
+        self.assertEqual(out, "https://e.com/p?id=5&page=2")
+
+    def test_no_strip_keeps_everything(self):
+        out = sitemapper.normalize_url(
+            "https://e.com/p?utm_source=fb&id=5", strip_params=None)
+        self.assertEqual(out, "https://e.com/p?utm_source=fb&id=5")
+
+    def test_ignore_query_drops_all(self):
+        out = sitemapper.normalize_url("https://e.com/p?id=5", ignore_query=True)
+        self.assertEqual(out, "https://e.com/p")
+
+
+class ReportTests(unittest.TestCase):
+    """broken / internal / external link reports (the --report-dir feature)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def _run_reports(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        args = Args(self.base + "/")
+        args.report_dir = d
+        c = sitemapper.Crawler(args.url, args)
+        c.run()
+        sitemapper.write_reports(c, d)
+        rows = {}
+        for name in ("broken-links.csv", "internal-links.csv", "external-links.csv"):
+            with open(os.path.join(d, name), newline="") as fh:
+                rows[name] = list(csv.DictReader(fh))
+        return rows
+
+    def test_broken_link_and_referrer(self):
+        rows = self._run_reports()["broken-links.csv"]
+        broken = [(r["broken_url"], r["referring_page"]) for r in rows]
+        self.assertTrue(any(u.endswith("/missing") for u, _ in broken))
+        # the referrer must be the homepage that links to /missing
+        ref = [r for u, r in broken if u.endswith("/missing")][0]
+        self.assertTrue(ref.rstrip("/").endswith("127.0.0.1:%d"
+                        % self.server.server_address[1]))
+
+    def test_internal_and_external_split(self):
+        rows = self._run_reports()
+        internal = {r["target_url"] for r in rows["internal-links.csv"]}
+        external = {r["target_url"] for r in rows["external-links.csv"]}
+        self.assertTrue(any("/about" in u for u in internal))
+        self.assertIn("https://other.example.org/x", external)
+        self.assertFalse(any("other.example.org" in u for u in internal))
 
 
 class RobotsTests(unittest.TestCase):

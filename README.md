@@ -72,7 +72,10 @@ Sitemap: https://example.com/sitemap.xml
 | `--state PATH` | JSON cache enabling honest, per-URL `lastmod` across runs (recommended for cron) |
 | `--include-subdomains` | Also crawl subdomains of the registrable domain |
 | `--no-docs` | HTML pages only; exclude PDFs (PDFs are included by default) |
-| `--ignore-query` | Treat URLs differing only by query string as one |
+| `--report-dir DIR` | Also write `broken-links.csv`, `internal-links.csv`, `external-links.csv` |
+| `--ignore-query` | Drop the **entire** query string (opt-in; see [Query strings](#query-strings)) |
+| `--strip-params LIST` | Query params to drop as tracking junk (default list; `utm_*` always dropped) |
+| `--no-strip-params` | Keep every query param, including tracking ones |
 | `--gzip` | Write gzipped `sitemap.xml.gz` |
 | `--delay SECONDS` | Politeness delay between requests (defaults to robots `Crawl-delay`) |
 | `--max-pages N` | Safety cap on pages fetched (`0` = unlimited; default 50000) |
@@ -81,6 +84,57 @@ Sitemap: https://example.com/sitemap.xml
 | `-v`, `-vv` | Info / debug logging |
 
 Full list: `python sitemapper.py --help`.
+
+### Link reports (broken / internal / external)
+
+Pass `--report-dir DIR` to also emit three CSVs alongside the sitemap:
+
+```bash
+python sitemapper.py https://example.com --report-dir ./reports
+```
+
+- **`broken-links.csv`** — every URL that failed to load (HTTP 4xx/5xx or a
+  connection error), **with the page(s) that link to it**. Columns:
+  `broken_url, status, referring_page` (one row per broken-URL/referrer pair).
+  Broken links hurt user experience and waste crawl budget — open this file, go
+  to each `referring_page`, and fix or remove the link.
+- **`internal-links.csv`** — every discovered link that points to your own
+  registrable domain (nav, cross-links, footers, pagination). Columns:
+  `source_page, target_url`.
+- **`external-links.csv`** — every link that points to a third-party domain
+  (social profiles, references, etc.). Columns: `source_page, target_url`.
+
+Notes:
+- Broken-link detection covers **internal** URLs the crawler actually fetched;
+  it does not fetch external URLs, so it won't flag a dead third-party link.
+- On very large sites `internal-links.csv` can be big — it's a full edge list
+  (every link on every crawled page), which is what makes it actionable.
+- Collection only happens when `--report-dir` is set, so normal runs stay lean.
+
+### Query strings
+
+By default sitemapper **keeps** query strings, because on many sites `?` carries a
+real page identity (`?id=42`, `?page=2`, faceted catalogs). Blindly discarding
+queries would silently drop real pages. Two mechanisms keep the output clean
+without that risk:
+
+1. **`rel="canonical"` is honored.** A `?utm=…`-tagged page that declares a
+   canonical URL collapses to it automatically — the correct, standards-based
+   dedup.
+2. **Tracking params are stripped by default** (`--strip-params`). Pure
+   click/tracking junk that never identifies a page is removed during
+   normalization: `gclid`, `fbclid`, `msclkid`, `mc_cid`, `_ga`, and **any
+   `utm_*`**, among others. Real params (`id`, `page`, `product`, …) are kept.
+   - Customize: `--strip-params "utm_source,ref,sessionid"` (replaces the list;
+     `utm_*` is still always dropped).
+   - Disable entirely: `--no-strip-params`.
+
+Only reach for **`--ignore-query`** — which drops the *whole* query string — when
+you know a site's query params are all noise (e.g. a gallery that appends sort
+params to every link). It's opt-in precisely because it can merge genuinely
+distinct pages. If a crawl balloons because a section appends combinatorial query
+params to links, prefer adding the offending names to `--strip-params`, or cap it
+with `--max-pages`, before resorting to `--ignore-query`.
 
 ### Large sites
 

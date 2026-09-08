@@ -8,4 +8,9 @@ sitemap-*.xml.gz
 sitemap_index.xml
 *.state.json
 *.log
+# generated link reports
+broken-links.csv
+internal-links.csv
+external-links.csv
+reports/
 .venv/

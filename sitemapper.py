@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import csv
 import gzip
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -30,11 +32,22 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
-from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
+from urllib.parse import (parse_qsl, urldefrag, urlencode, urljoin, urlsplit,
+                          urlunsplit)
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
+
+# Query params dropped during URL normalization by default: pure click/tracking
+# junk that never identifies a distinct page. Any `utm_*` param is also dropped.
+# This is intentionally conservative — it never touches params a site might use
+# as a real page id (`?id=`, `?page=`, `?product=`). To collapse ALL query
+# variants, use --ignore-query (opt-in); to disable stripping, --no-strip-params.
+DEFAULT_STRIP_PARAMS = {
+    "gclid", "fbclid", "msclkid", "dclid", "gclsrc", "yclid", "wbraid", "gbraid",
+    "mc_cid", "mc_eid", "mkt_tok", "igshid", "_ga", "_gl", "vero_id", "oly_enc_id",
+}
 
 # Per-sitemap-file limits from the sitemaps.org protocol.
 MAX_URLS_PER_FILE = 50000
@@ -55,9 +68,19 @@ log = logging.getLogger("sitemapper")
 # --------------------------------------------------------------------------- #
 # URL helpers
 # --------------------------------------------------------------------------- #
-def normalize_url(url: str, base: str | None = None, ignore_query: bool = False) -> str | None:
-    """Resolve, strip fragment, lowercase host, drop default port. Returns a
-    normalized absolute http(s) URL, or None if the scheme is not http(s)."""
+def _keep_param(name: str, strip_params) -> bool:
+    n = name.lower()
+    if n.startswith("utm_"):
+        return False
+    return n not in strip_params
+
+
+def normalize_url(url: str, base: str | None = None, ignore_query: bool = False,
+                  strip_params=None) -> str | None:
+    """Resolve, strip fragment, lowercase host, drop default port. With
+    ignore_query, drop the whole query; otherwise drop only tracking params in
+    strip_params (plus utm_*). Returns a normalized absolute http(s) URL, or
+    None if the scheme is not http(s)."""
     if base:
         url = urljoin(base, url)
     url, _frag = urldefrag(url)
@@ -79,7 +102,14 @@ def normalize_url(url: str, base: str | None = None, ignore_query: bool = False)
         userinfo = parts.username + ((":" + parts.password) if parts.password else "")
         netloc = "%s@%s" % (userinfo, netloc)
     path = parts.path or "/"
-    query = "" if ignore_query else parts.query
+    if ignore_query:
+        query = ""
+    else:
+        query = parts.query
+        if query and strip_params:
+            kept = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True)
+                    if _keep_param(k, strip_params)]
+            query = urlencode(kept)
     return urlunsplit((parts.scheme, netloc, path, query, ""))
 
 
@@ -364,7 +394,15 @@ class RobotsRules:
 class Crawler:
     def __init__(self, root: str, args) -> None:
         self.args = args
-        self.root = normalize_url(root, ignore_query=args.ignore_query)
+        # Query-param stripping: None disables it; otherwise a set of exact
+        # param names (utm_* is always dropped when stripping is on).
+        if getattr(args, "no_strip_params", False):
+            self.strip_params = None
+        else:
+            raw = getattr(args, "strip_params", None)
+            self.strip_params = {p.strip().lower()
+                                 for p in (raw or "").split(",") if p.strip()}
+        self.root = self._norm(root)
         if not self.root:
             raise ValueError("start URL must be an http(s) URL")
         self.root_host = urlsplit(self.root).hostname or ""
@@ -377,6 +415,17 @@ class Crawler:
         self.seen: set[str] = set()                  # enqueued/visited
         self.canonical_map: dict[str, str] = {}      # variant -> canonical
         self.skips: dict[str, int] = {}              # reason -> count
+
+        # Link-report collectors (populated only when --report-dir is set).
+        self.report = getattr(args, "report_dir", None) is not None
+        self.fetch_status: dict[str, int] = {}       # url -> HTTP status (0=err)
+        self.internal_edges: set = set()             # (source_page, target)
+        self.external_edges: set = set()             # (source_page, target)
+        self.referrers: dict[str, set] = {}          # target -> {source pages}
+
+    def _norm(self, url: str, base: str | None = None):
+        return normalize_url(url, base=base, ignore_query=self.args.ignore_query,
+                             strip_params=self.strip_params)
 
     # ---- robots -----------------------------------------------------------
     def _load_robots(self):
@@ -436,6 +485,8 @@ class Crawler:
 
             res = fetch(url, self.user_agent, self.args.timeout, self.args.max_bytes)
             pages += 1
+            if self.report:
+                self.fetch_status[url] = res.status if res.status else 0
             if self.args.progress and pages % self.args.progress == 0:
                 log.info("progress: fetched=%d included=%d queued=%d",
                          pages, len(self.included), len(queue))
@@ -448,7 +499,7 @@ class Crawler:
                 continue
 
             # A redirect means this URL is not itself canonical content.
-            final = normalize_url(res.final_url, ignore_query=self.args.ignore_query)
+            final = self._norm(res.final_url)
             if res.redirected:
                 self._skip("redirect")
                 if final and final not in self.seen and same_scope(
@@ -491,7 +542,7 @@ class Crawler:
         # Determine the canonical URL for this page.
         canonical = url
         if p.canonical:
-            c = normalize_url(p.canonical, base=url, ignore_query=self.args.ignore_query)
+            c = self._norm(p.canonical, base=url)
             if c:
                 canonical = c
         if canonical != url:
@@ -505,14 +556,16 @@ class Crawler:
         else:
             self._include(canonical, res)
 
-        # Enqueue outbound links unless this page says nofollow.
-        if nofollow or depth >= self.args.max_depth:
-            return
+        # Record every outbound link for the reports (internal vs external),
+        # independent of whether we will crawl it, then apply crawl rules.
+        follow = not (nofollow or depth >= self.args.max_depth)
         for href, link_nofollow in p.links:
-            if link_nofollow:
+            nxt = self._norm(href, base=url)
+            if not nxt:
                 continue
-            nxt = normalize_url(href, base=url, ignore_query=self.args.ignore_query)
-            if not nxt or nxt in self.seen:
+            if self.report:
+                self._record_link(url, nxt)
+            if not follow or link_nofollow or nxt in self.seen:
                 continue
             if not same_scope(nxt, self.root_host, self.args.include_subdomains):
                 continue
@@ -524,6 +577,14 @@ class Crawler:
                 self._skip("robots-disallowed")
                 continue
             queue.append((nxt, depth + 1))
+
+    def _record_link(self, source: str, target: str) -> None:
+        t_host = urlsplit(target).hostname or ""
+        if registrable_host(t_host) == registrable_host(self.root_host):
+            self.internal_edges.add((source, target))
+            self.referrers.setdefault(target, set()).add(source)
+        else:
+            self.external_edges.add((source, target))
 
     def _include(self, url: str, res: FetchResult) -> None:
         if url in self.included:
@@ -623,6 +684,44 @@ def write_output(urls, args, root) -> list[str]:
     return written
 
 
+def write_reports(crawler, report_dir: str) -> dict:
+    """Write broken-links.csv, internal-links.csv, external-links.csv.
+
+    - broken-links.csv: one row per (broken URL, referring page). "Broken" is any
+      fetched URL that returned 4xx/5xx or a connection error. The referring page
+      is where the link lives, so you know exactly where to fix it.
+    - internal-links.csv / external-links.csv: every discovered link edge
+      (source page -> target), classified by whether the target is on your own
+      registrable domain.
+    """
+    os.makedirs(report_dir, exist_ok=True)
+    counts = {"broken": 0, "internal": len(crawler.internal_edges),
+              "external": len(crawler.external_edges)}
+
+    broken = sorted((u, s) for u, s in crawler.fetch_status.items()
+                    if s == 0 or s >= 400)
+    counts["broken"] = len(broken)
+    with open(os.path.join(report_dir, "broken-links.csv"), "w", newline="",
+              encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["broken_url", "status", "referring_page"])
+        for u, s in broken:
+            status = "error" if s == 0 else s
+            refs = sorted(crawler.referrers.get(u, ())) or ["(start URL / no recorded referrer)"]
+            for r in refs:
+                w.writerow([u, status, r])
+
+    for name, edges in (("internal-links.csv", crawler.internal_edges),
+                        ("external-links.csv", crawler.external_edges)):
+        with open(os.path.join(report_dir, name), "w", newline="",
+                  encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["source_page", "target_url"])
+            for src, tgt in sorted(edges):
+                w.writerow([src, tgt])
+    return counts
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -658,7 +757,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-docs", dest="include_docs", action="store_false",
                    help="HTML pages only; exclude PDFs")
     p.add_argument("--ignore-query", action="store_true",
-                   help="Treat URLs that differ only by query string as one")
+                   help="Treat URLs that differ only by query string as one "
+                        "(drops the ENTIRE query; opt-in — can merge genuinely "
+                        "distinct ?id=/?page= pages, so off by default)")
+    p.add_argument("--strip-params", default=",".join(sorted(DEFAULT_STRIP_PARAMS)),
+                   help="Comma-separated query params to drop during normalization "
+                        "(tracking junk). utm_* is always dropped. Default: a "
+                        "conservative tracking list. Has no effect with --ignore-query.")
+    p.add_argument("--no-strip-params", action="store_true",
+                   help="Disable query-param stripping entirely (keep every param)")
+    p.add_argument("--report-dir", default=None,
+                   help="Also write broken-links.csv, internal-links.csv and "
+                        "external-links.csv into this directory")
     p.add_argument("--render-js", action="store_true",
                    help="Render pages with Playwright to find JS-injected links "
                         "(optional; requires `pip install playwright`)")
@@ -688,7 +798,7 @@ def apply_config(args, parser) -> None:
         return
     sec = cp["sitemapper"]
     bools = {"include_subdomains", "include_docs", "ignore_query", "render_js",
-             "gzip", "respect_robots"}
+             "gzip", "respect_robots", "no_strip_params"}
     ints = {"max_pages", "max_depth", "max_bytes", "progress"}
     floats = {"timeout", "delay"}
     for key in sec:
@@ -735,6 +845,12 @@ def main(argv=None) -> int:
                 len(urls), len(crawler.seen), elapsed, skip_summary or "none")
     for w in written:
         log.warning("wrote %s", w)
+
+    if args.report_dir is not None:
+        c = write_reports(crawler, args.report_dir)
+        log.warning("reports: %d broken link(s), %d internal, %d external -> %s",
+                    c["broken"], c["internal"], c["external"], args.report_dir)
+
     if not urls:
         log.warning("no indexable URLs found — check the start URL and robots.txt")
         return 1
