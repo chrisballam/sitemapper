@@ -38,7 +38,7 @@ from urllib.parse import (parse_qsl, urldefrag, urlencode, urljoin, urlsplit,
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # Query params dropped during URL normalization by default: pure click/tracking
 # junk that never identifies a distinct page. Any `utm_*` param is also dropped.
@@ -882,6 +882,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--print-cron", choices=("daily", "weekly", "monthly"),
                    help="Print a ready-to-paste crontab line for this invocation "
                         "and exit (does not crawl)")
+    p.add_argument("--omit-lastmod", action="store_true",
+                   help="Do not emit <lastmod> at all. Use this when pages are "
+                        "dynamic with no Last-Modified header and per-request-"
+                        "varying content, where a content hash would bump the date "
+                        "every run. A sitemap without lastmod is fully valid.")
     p.add_argument("--gzip", action="store_true", help="Write gzipped sitemap(s)")
     p.add_argument("--public-path", default="",
                    help="URL path prefix where shards will be hosted, for the "
@@ -908,7 +913,8 @@ def apply_config(args, parser) -> None:
         return
     sec = cp["sitemapper"]
     bools = {"include_subdomains", "include_docs", "ignore_query", "render_js",
-             "gzip", "respect_robots", "no_strip_params", "report_crawlable_only"}
+             "gzip", "respect_robots", "no_strip_params", "report_crawlable_only",
+             "omit_lastmod"}
     ints = {"max_pages", "max_depth", "max_bytes", "progress"}
     floats = {"timeout", "delay"}
     for key in sec:
@@ -981,6 +987,8 @@ def main(argv=None) -> int:
     started = time.time()
     crawler.run()
     urls = crawler.urls()
+    if args.omit_lastmod:
+        urls = [(loc, None) for loc, _ in urls]
 
     written = write_output(urls, args, crawler.root)
 

@@ -26,6 +26,12 @@ It also produces **honest `<lastmod>`**:
   page is stamped with today's date; real change-dates accrue as you re-run it.
 - Never fabricates a single generation timestamp for every URL (a common mistake
   that makes Google discount `lastmod` site-wide).
+- **`--omit-lastmod`** drops `<lastmod>` entirely. Use it when pages are dynamic,
+  send no `Last-Modified` header, **and** carry per-request-varying content (a CSRF
+  token, a CSP nonce, a timestamp) — there the content hash would flip every run
+  and stamp a misleading "changed today". A sitemap with no `lastmod` is fully
+  valid; search engines just fall back to their own crawl signals, which is better
+  than an unreliable date.
 
 ## Requirements
 
@@ -87,6 +93,7 @@ the command can write to that directory.
 |------|---------|
 | `-o, --output PATH` | Output file (default `sitemap.xml`, or `sitemap_index.xml` when split) |
 | `--state PATH` | JSON cache enabling honest, per-URL `lastmod` across runs (recommended for cron) |
+| `--omit-lastmod` | Drop `<lastmod>` entirely (best for dynamic sites with per-request-varying HTML) |
 | `--include-subdomains` | Also crawl subdomains of the registrable domain |
 | `--no-docs` | HTML pages only; exclude PDFs (PDFs are included by default) |
 | `--report-dir DIR` | Also write `broken-links.csv`, `internal-links.csv`, `external-links.csv` |

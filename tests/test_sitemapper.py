@@ -192,6 +192,12 @@ class UnitTests(unittest.TestCase):
         self.assertNotIn("priority", xml)
         self.assertNotIn("changefreq", xml)
 
+    def test_urlset_omits_lastmod_when_none(self):
+        xml = sitemapper.build_urlset([("https://e.com/a", None),
+                                       ("https://e.com/b", None)])
+        self.assertIn("<loc>https://e.com/a</loc>", xml)
+        self.assertNotIn("<lastmod>", xml)
+
     def test_chunking_splits_on_url_count(self):
         urls = [("https://e.com/%d" % i, None) for i in range(120)]
         chunks = list(sitemapper.chunk_urls(urls, max_urls=50))
