@@ -327,6 +327,21 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(d2, "2026-01-01")          # only CF token/nonce differ
         self.assertNotIn("u", sc.changed)            # so NOT flagged changed
 
+    def test_hash_ignores_cloudflare_script_reorder(self):
+        sc = sitemapper.StateCache(None, hash_ignore=sitemapper.DEFAULT_HASH_IGNORE)
+        beacon = (b'<script type="module" src="https://static.cloudflareinsights.'
+                  b'com/beacon.min.js/v1" data-cf-beacon=\'{"token":"abc"}\'>'
+                  b'</script>')
+        chal = (b'<script>(function(){var s="/cdn-cgi/challenge-platform/scripts/'
+                b'jsd/main.js";})();</script>')
+        b1 = b"<html>real content" + beacon + chal + b"</html>"
+        b2 = b"<html>real content" + chal + beacon + b"</html>"  # order swapped
+        d1 = sc.lastmod_for("u", b1, None, "2026-01-01")
+        sc.changed.clear()
+        d2 = sc.lastmod_for("u", b2, None, "2026-09-09")
+        self.assertEqual(d2, "2026-01-01")          # both scripts stripped
+        self.assertNotIn("u", sc.changed)
+
     def test_hash_still_detects_real_change(self):
         sc = sitemapper.StateCache(None, hash_ignore=sitemapper.DEFAULT_HASH_IGNORE)
         sc.lastmod_for("u", b"<html>version one</html>", None, "2026-01-01")

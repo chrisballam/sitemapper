@@ -38,7 +38,7 @@ from urllib.parse import (parse_qsl, urldefrag, urlencode, urljoin, urlsplit,
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 
 # Query params dropped during URL normalization by default: pure click/tracking
 # junk that never identifies a distinct page. Any `utm_*` param is also dropped.
@@ -55,7 +55,13 @@ DEFAULT_STRIP_PARAMS = {
 # rotating token (e.g. Cloudflare's challenge param) doesn't make every page look
 # "changed" on every crawl. Bytes patterns — the hash runs on raw bytes.
 DEFAULT_HASH_IGNORE = [
-    rb"__CF\$cv\$params=\{[^}]*\}",   # Cloudflare challenge platform (r/t rotate)
+    # Cloudflare injects two scripts (the Insights beacon + the challenge-platform
+    # loader) in a nondeterministic ORDER per request, and the loader carries a
+    # rotating token. Strip both whole scripts so neither the reorder nor the
+    # token churns the hash.
+    rb"<script[^>]*cloudflareinsights\.com[^>]*>\s*</script>",
+    rb"<script>[^<]*cdn-cgi/challenge-platform[^<]*</script>",
+    rb"__CF\$cv\$params=\{[^}]*\}",   # Cloudflare challenge token (r/t rotate)
     rb"cf_chl_[A-Za-z0-9_]*",          # Cloudflare challenge ids
     rb"nonce=[\"'][^\"']*[\"']",       # CSP per-request nonces
 ]
