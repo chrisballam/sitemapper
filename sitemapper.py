@@ -38,7 +38,7 @@ from urllib.parse import (parse_qsl, urldefrag, urlencode, urljoin, urlsplit,
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
-__version__ = "1.2.4"
+__version__ = "1.2.5"
 
 # Query params dropped during URL normalization by default: pure click/tracking
 # junk that never identifies a distinct page. Any `utm_*` param is also dropped.
@@ -58,8 +58,9 @@ DEFAULT_STRIP_PARAMS = {
 # page content that <lastmod> is meant to track. CSP nonces (on any tag) too.
 # Bytes patterns with inline (?s) so `.` spans newlines — the hash runs on raw bytes.
 DEFAULT_HASH_IGNORE = [
-    rb"(?s)<script\b[^>]*>.*?</script>",   # all scripts (per-request analytics junk)
-    rb"nonce=[\"'][^\"']*[\"']",            # CSP per-request nonces on any tag
+    rb"(?s)<script\b[^>]*>.*?</script>",         # all scripts (analytics junk)
+    rb"<input\b[^>]*type=[\"']?hidden[\"']?[^>]*>",  # hidden form fields (CSRF tokens)
+    rb"nonce=[\"'][^\"']*[\"']",                  # CSP per-request nonces on any tag
 ]
 
 # Per-sitemap-file limits from the sitemaps.org protocol.
