@@ -103,6 +103,8 @@ class Args:
         self.print_cron = None
         self.gzip = False
         self.output = None
+        self.omit_lastmod = False
+        self.lastmod_ignore = []
 
 
 class CrawlTests(unittest.TestCase):
@@ -309,6 +311,29 @@ class FeatureTests(unittest.TestCase):
         self.assertIn("--state", line)
         self.assertIn("--indexnow", line)
         self.assertIn(">> /var/log/sitemapper.log 2>&1", line)
+
+    def test_hash_ignores_cloudflare_and_nonce(self):
+        sc = sitemapper.StateCache(None, hash_ignore=sitemapper.DEFAULT_HASH_IGNORE)
+        b1 = (b"<html>real content"
+              b"<script>window.__CF$cv$params={r:'aaa111',t:'MTc4OA=='};</script>"
+              b"<style nonce=\"abc123\">x</style></html>")
+        b2 = (b"<html>real content"
+              b"<script>window.__CF$cv$params={r:'ZZZ999',t:'QQQ888=='};</script>"
+              b"<style nonce=\"different99\">x</style></html>")
+        d1 = sc.lastmod_for("u", b1, None, "2026-01-01")
+        sc.changed.clear()
+        d2 = sc.lastmod_for("u", b2, None, "2026-09-09")
+        self.assertEqual(d1, "2026-01-01")
+        self.assertEqual(d2, "2026-01-01")          # only CF token/nonce differ
+        self.assertNotIn("u", sc.changed)            # so NOT flagged changed
+
+    def test_hash_still_detects_real_change(self):
+        sc = sitemapper.StateCache(None, hash_ignore=sitemapper.DEFAULT_HASH_IGNORE)
+        sc.lastmod_for("u", b"<html>version one</html>", None, "2026-01-01")
+        sc.changed.clear()
+        d = sc.lastmod_for("u", b"<html>version TWO</html>", None, "2026-09-09")
+        self.assertEqual(d, "2026-09-09")            # genuine edit still bumps
+        self.assertIn("u", sc.changed)
 
     def test_state_change_tracking(self):
         sc = sitemapper.StateCache(None)

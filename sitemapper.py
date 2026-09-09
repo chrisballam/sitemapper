@@ -38,7 +38,7 @@ from urllib.parse import (parse_qsl, urldefrag, urlencode, urljoin, urlsplit,
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 # Query params dropped during URL normalization by default: pure click/tracking
 # junk that never identifies a distinct page. Any `utm_*` param is also dropped.
@@ -49,6 +49,16 @@ DEFAULT_STRIP_PARAMS = {
     "gclid", "fbclid", "msclkid", "dclid", "gclsrc", "yclid", "wbraid", "gbraid",
     "mc_cid", "mc_eid", "mkt_tok", "igshid", "_ga", "_gl", "vero_id", "oly_enc_id",
 }
+
+# Per-request tokens that CDNs/frameworks inject into otherwise-stable HTML.
+# These are removed before computing the content hash used for <lastmod>, so a
+# rotating token (e.g. Cloudflare's challenge param) doesn't make every page look
+# "changed" on every crawl. Bytes patterns — the hash runs on raw bytes.
+DEFAULT_HASH_IGNORE = [
+    rb"__CF\$cv\$params=\{[^}]*\}",   # Cloudflare challenge platform (r/t rotate)
+    rb"cf_chl_[A-Za-z0-9_]*",          # Cloudflare challenge ids
+    rb"nonce=[\"'][^\"']*[\"']",       # CSP per-request nonces
+]
 
 # Per-sitemap-file limits from the sitemaps.org protocol.
 MAX_URLS_PER_FILE = 50000
@@ -271,16 +281,27 @@ class StateCache:
     when it changes (or is new), lastmod is set to today. This yields a real
     "content last changed" date even when the server sends no Last-Modified."""
 
-    def __init__(self, path: str | None):
+    def __init__(self, path: str | None, hash_ignore=None):
         self.path = path
         self.data: dict[str, dict] = {}
         self.changed: set = set()  # URLs new or content-changed this run
+        self._ignore = []
+        for pat in (hash_ignore or []):
+            try:
+                self._ignore.append(re.compile(pat))
+            except re.error as e:
+                log.warning("ignoring bad --lastmod-ignore pattern %r: %s", pat, e)
         if path:
             try:
                 with open(path, "r", encoding="utf-8") as fh:
                     self.data = json.load(fh)
             except (OSError, ValueError):
                 self.data = {}
+
+    def _digest(self, body: bytes) -> str:
+        for rx in self._ignore:
+            body = rx.sub(b"", body)
+        return hashlib.sha256(body).hexdigest()
 
     def lastmod_for(self, url: str, body: bytes, header_lm: datetime | None,
                     today: str) -> str | None:
@@ -291,7 +312,7 @@ class StateCache:
                 self.changed.add(url)
             self.data[url] = {"lastmod": d}
             return d
-        digest = hashlib.sha256(body).hexdigest()
+        digest = self._digest(body)
         if prev and prev.get("hash") == digest:
             return prev.get("lastmod")
         self.changed.add(url)
@@ -416,7 +437,10 @@ class Crawler:
         self.root_host = urlsplit(self.root).hostname or ""
         self.user_agent = args.user_agent
         self.robots = self._load_robots()
-        self.state = StateCache(args.state)
+        hash_ignore = list(DEFAULT_HASH_IGNORE)
+        for p in (getattr(args, "lastmod_ignore", None) or []):
+            hash_ignore.append(p.encode("utf-8"))
+        self.state = StateCache(args.state, hash_ignore=hash_ignore)
         self.today = datetime.now(timezone.utc).date().isoformat()
 
         self.included: dict[str, str | None] = {}   # url -> lastmod (or None)
@@ -887,6 +911,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "dynamic with no Last-Modified header and per-request-"
                         "varying content, where a content hash would bump the date "
                         "every run. A sitemap without lastmod is fully valid.")
+    p.add_argument("--lastmod-ignore", action="append", metavar="REGEX", default=[],
+                   help="Regex (repeatable) stripped from page HTML before the "
+                        "content hash used for lastmod, so per-request tokens don't "
+                        "flip the date. Cloudflare challenge tokens and CSP nonces "
+                        "are already stripped by default.")
     p.add_argument("--gzip", action="store_true", help="Write gzipped sitemap(s)")
     p.add_argument("--public-path", default="",
                    help="URL path prefix where shards will be hosted, for the "
@@ -919,8 +948,8 @@ def apply_config(args, parser) -> None:
     floats = {"timeout", "delay"}
     for key in sec:
         attr = key.replace("-", "_")
-        if not hasattr(args, attr):
-            continue
+        if not hasattr(args, attr) or attr == "lastmod_ignore":
+            continue  # lastmod_ignore is a repeatable CLI list, not an INI scalar
         if attr in bools:
             setattr(args, attr, sec.getboolean(key))
         elif attr in ints:
