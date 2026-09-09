@@ -38,7 +38,7 @@ from urllib.parse import (parse_qsl, urldefrag, urlencode, urljoin, urlsplit,
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 # Query params dropped during URL normalization by default: pure click/tracking
 # junk that never identifies a distinct page. Any `utm_*` param is also dropped.
@@ -50,20 +50,16 @@ DEFAULT_STRIP_PARAMS = {
     "mc_cid", "mc_eid", "mkt_tok", "igshid", "_ga", "_gl", "vero_id", "oly_enc_id",
 }
 
-# Per-request tokens that CDNs/frameworks inject into otherwise-stable HTML.
-# These are removed before computing the content hash used for <lastmod>, so a
-# rotating token (e.g. Cloudflare's challenge param) doesn't make every page look
-# "changed" on every crawl. Bytes patterns — the hash runs on raw bytes.
+# Content that varies per request but is not page *content* — removed before the
+# content hash used for <lastmod>, so it doesn't make every page look "changed"
+# on every crawl. We strip all <script> blocks outright: analytics/CDN/tag-manager
+# snippets (Cloudflare's rotating challenge token + reordered scripts, New Relic's
+# per-request NREUM.info, GTM, etc.) all live in scripts, and none of them are the
+# page content that <lastmod> is meant to track. CSP nonces (on any tag) too.
+# Bytes patterns with inline (?s) so `.` spans newlines — the hash runs on raw bytes.
 DEFAULT_HASH_IGNORE = [
-    # Cloudflare injects two scripts (the Insights beacon + the challenge-platform
-    # loader) in a nondeterministic ORDER per request, and the loader carries a
-    # rotating token. Strip both whole scripts so neither the reorder nor the
-    # token churns the hash.
-    rb"<script[^>]*cloudflareinsights\.com[^>]*>\s*</script>",
-    rb"<script>[^<]*cdn-cgi/challenge-platform[^<]*</script>",
-    rb"__CF\$cv\$params=\{[^}]*\}",   # Cloudflare challenge token (r/t rotate)
-    rb"cf_chl_[A-Za-z0-9_]*",          # Cloudflare challenge ids
-    rb"nonce=[\"'][^\"']*[\"']",       # CSP per-request nonces
+    rb"(?s)<script\b[^>]*>.*?</script>",   # all scripts (per-request analytics junk)
+    rb"nonce=[\"'][^\"']*[\"']",            # CSP per-request nonces on any tag
 ]
 
 # Per-sitemap-file limits from the sitemaps.org protocol.

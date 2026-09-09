@@ -342,12 +342,22 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(d2, "2026-01-01")          # both scripts stripped
         self.assertNotIn("u", sc.changed)
 
+    def test_hash_ignores_all_script_content(self):
+        sc = sitemapper.StateCache(None, hash_ignore=sitemapper.DEFAULT_HASH_IGNORE)
+        b1 = b"<html><p>hello</p><script>var t=111;\nNREUM.info={x:1}</script></html>"
+        b2 = b"<html><p>hello</p><script>var t=999;\nNREUM.info={x:2}</script></html>"
+        d1 = sc.lastmod_for("u", b1, None, "2026-01-01")
+        sc.changed.clear()
+        d2 = sc.lastmod_for("u", b2, None, "2026-09-09")
+        self.assertEqual(d2, "2026-01-01")           # only script bytes differ
+        self.assertNotIn("u", sc.changed)
+
     def test_hash_still_detects_real_change(self):
         sc = sitemapper.StateCache(None, hash_ignore=sitemapper.DEFAULT_HASH_IGNORE)
-        sc.lastmod_for("u", b"<html>version one</html>", None, "2026-01-01")
+        sc.lastmod_for("u", b"<html><p>version one</p></html>", None, "2026-01-01")
         sc.changed.clear()
-        d = sc.lastmod_for("u", b"<html>version TWO</html>", None, "2026-09-09")
-        self.assertEqual(d, "2026-09-09")            # genuine edit still bumps
+        d = sc.lastmod_for("u", b"<html><p>version TWO</p></html>", None, "2026-09-09")
+        self.assertEqual(d, "2026-09-09")            # genuine body edit still bumps
         self.assertIn("u", sc.changed)
 
     def test_state_change_tracking(self):

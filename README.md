@@ -24,9 +24,11 @@ It also produces **honest `<lastmod>`**:
 - Otherwise, with a `--state` cache, it hashes each page's content and records the
   date the content **actually changed** across runs. On the very first run every
   page is stamped with today's date; real change-dates accrue as you re-run it.
-  Before hashing it strips known per-request tokens (Cloudflare's challenge param,
-  CSP `nonce`s) so a rotating token doesn't make every page look "changed" each
-  crawl — add your own with `--lastmod-ignore REGEX` if a page still flips.
+  Before hashing it removes `<script>` blocks and CSP `nonce`s, so per-request
+  analytics/CDN tokens (Cloudflare's rotating challenge token, New Relic's
+  `NREUM.info`, GTM, etc.) don't make every page look "changed" each crawl. Real
+  content edits are still detected. Add extra patterns with `--lastmod-ignore
+  REGEX` if a page still flips.
 - Never fabricates a single generation timestamp for every URL (a common mistake
   that makes Google discount `lastmod` site-wide).
 - **`--omit-lastmod`** drops `<lastmod>` entirely. Use it when pages are dynamic,
