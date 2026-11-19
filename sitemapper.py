@@ -38,7 +38,7 @@ from urllib.parse import (parse_qsl, urldefrag, urlencode, urljoin, urlsplit,
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
-__version__ = "1.2.5"
+__version__ = "2.0.0"
 
 # Query params dropped during URL normalization by default: pure click/tracking
 # junk that never identifies a distinct page. Any `utm_*` param is also dropped.
@@ -62,6 +62,75 @@ DEFAULT_HASH_IGNORE = [
     rb"<input\b[^>]*type=[\"']?hidden[\"']?[^>]*>",  # hidden form fields (CSRF tokens)
     rb"nonce=[\"'][^\"']*[\"']",                  # CSP per-request nonces on any tag
 ]
+
+# When a page has a <main> element, only its contents feed the content hash, so
+# a site-wide header/nav/footer edit doesn't re-date every URL. Greedy to the
+# last </main> so nested markup is kept.
+_MAIN_RX = re.compile(rb"(?is)<main\b[^>]*>(.*)</main>")
+HASH_SCOPES = ("main", "body")
+
+# A page's own declared "last modified" date beats both the HTTP header and the
+# content hash (unless --no-declared-lastmod): schema.org dateModified on the
+# JSON-LD node that describes this URL, else <meta property="article:modified_time">.
+_LDJSON_RX = re.compile(
+    r"(?is)<script\b[^>]*type=[\"']?application/ld\+json[\"']?[^>]*>(.*?)</script>")
+_ISO_DATE_RX = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})")
+
+
+def _iso_date(value, today: str | None = None) -> str | None:
+    """'YYYY-MM-DD' from an ISO-8601 date/datetime string (the page's own
+    calendar date, offset ignored), or None. Rejects dates more than one day
+    after `today` (allows for time-zone offsets ahead of UTC)."""
+    if not isinstance(value, str):
+        return None
+    m = _ISO_DATE_RX.match(value)
+    if not m:
+        return None
+    try:
+        d = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+    except ValueError:
+        return None
+    if today:
+        t = datetime.strptime(today, "%Y-%m-%d").date()
+        if (d - t).days > 1:
+            return None
+    return d.isoformat()
+
+
+def _jsonld_nodes(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            for n in _jsonld_nodes(v):
+                yield n
+    elif isinstance(obj, list):
+        for v in obj:
+            for n in _jsonld_nodes(v):
+                yield n
+
+
+def declared_modified(html: str, page_url: str, meta_modified: str | None = None,
+                      today: str | None = None) -> str | None:
+    """The page's self-declared last-modified date, or None.
+
+    Only JSON-LD nodes whose `url` or `@id` (fragment ignored) is this page count,
+    so a site-wide Person/WebSite node or an embedded ImageObject can't supply the
+    date. If several nodes describe the page, the latest date wins."""
+    target = normalize_url(page_url)
+    best = None
+    for block in _LDJSON_RX.findall(html):
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        for node in _jsonld_nodes(data):
+            ident = node.get("url") or node.get("@id")
+            if not isinstance(ident, str) or normalize_url(ident, base=page_url) != target:
+                continue
+            d = _iso_date(node.get("dateModified"), today)
+            if d and (best is None or d > best):
+                best = d
+    return best or _iso_date(meta_modified, today)
 
 # Per-sitemap-file limits from the sitemaps.org protocol.
 MAX_URLS_PER_FILE = 50000
@@ -158,6 +227,7 @@ class PageParser(HTMLParser):
         self.base_href: str | None = None
         self.meta_noindex = False
         self.meta_nofollow = False
+        self.modified_meta: str | None = None  # <meta property="article:modified_time">
 
     def handle_starttag(self, tag: str, attrs) -> None:
         a = {k.lower(): (v or "") for k, v in attrs}
@@ -172,6 +242,9 @@ class PageParser(HTMLParser):
                 self.canonical = a["href"]
         elif tag == "meta":
             name = a.get("name", "").lower()
+            if (a.get("property", "").lower() == "article:modified_time"
+                    and a.get("content") and self.modified_meta is None):
+                self.modified_meta = a["content"]
             if name in ("robots", "googlebot") and a.get("content"):
                 content = a["content"].lower()
                 if "noindex" in content:
@@ -279,13 +352,24 @@ def render_html_js(url: str, user_agent: str, timeout: float) -> str | None:
 # State cache for honest lastmod
 # --------------------------------------------------------------------------- #
 class StateCache:
-    """Maps normalized URL -> {'hash': <sha256>, 'lastmod': 'YYYY-MM-DD'}.
-    When a page's content hash is unchanged, its stored lastmod is preserved;
-    when it changes (or is new), lastmod is set to today. This yields a real
-    "content last changed" date even when the server sends no Last-Modified."""
+    """Maps normalized URL -> {'hash', 'lastmod': 'YYYY-MM-DD'[, 'scope']}.
 
-    def __init__(self, path: str | None, hash_ignore=None):
+    lastmod precedence: the page's own declared date (when the caller passes
+    one; the crawler does unless --no-declared-lastmod), then the HTTP
+    Last-Modified header, then the content hash (unchanged hash keeps the
+    stored date; a new or changed hash stamps today). With hash_scope="main"
+    (the default) the hash covers only <main> when present, so template-wide
+    edits don't re-date pages; hash_scope="body" hashes the whole page, as 1.x
+    did. Switching scope, including upgrading from a 1.x state file, keeps the
+    stored dates.
+
+    A declared date counts as "changed" (and is submitted to IndexNow) only when
+    the URL is new or the date moves *forward*: a date corrected backwards is
+    not new content."""
+
+    def __init__(self, path: str | None, hash_ignore=None, hash_scope: str = "main"):
         self.path = path
+        self.hash_scope = hash_scope if hash_scope in HASH_SCOPES else "main"
         self.data: dict[str, dict] = {}
         self.changed: set = set()  # URLs new or content-changed this run
         self._ignore = []
@@ -304,11 +388,26 @@ class StateCache:
     def _digest(self, body: bytes) -> str:
         for rx in self._ignore:
             body = rx.sub(b"", body)
+        if self.hash_scope == "main":
+            m = _MAIN_RX.search(body)
+            if m:
+                body = m.group(1)
         return hashlib.sha256(body).hexdigest()
 
+    def _entry(self, digest: str, lastmod: str) -> dict:
+        e = {"hash": digest, "lastmod": lastmod}
+        if self.hash_scope != "body":
+            e["scope"] = self.hash_scope
+        return e
+
     def lastmod_for(self, url: str, body: bytes, header_lm: datetime | None,
-                    today: str) -> str | None:
+                    today: str, declared: str | None = None) -> str | None:
         prev = self.data.get(url)
+        if declared:
+            if not prev or not prev.get("lastmod") or declared > prev["lastmod"]:
+                self.changed.add(url)
+            self.data[url] = self._entry(self._digest(body), declared)
+            return declared
         if header_lm is not None:
             d = header_lm.astimezone(timezone.utc).date().isoformat()
             if not prev or prev.get("lastmod") != d:
@@ -316,10 +415,15 @@ class StateCache:
             self.data[url] = {"lastmod": d}
             return d
         digest = self._digest(body)
-        if prev and prev.get("hash") == digest:
-            return prev.get("lastmod")
+        if prev and prev.get("hash"):
+            if prev.get("scope", "body") != self.hash_scope and prev.get("lastmod"):
+                # Hash scope switched (e.g. body -> main): re-key, don't re-date.
+                self.data[url] = self._entry(digest, prev["lastmod"])
+                return prev["lastmod"]
+            if prev["hash"] == digest:
+                return prev.get("lastmod")
         self.changed.add(url)
-        self.data[url] = {"hash": digest, "lastmod": today}
+        self.data[url] = self._entry(digest, today)
         return today
 
     def save(self) -> None:
@@ -443,7 +547,8 @@ class Crawler:
         hash_ignore = list(DEFAULT_HASH_IGNORE)
         for p in (getattr(args, "lastmod_ignore", None) or []):
             hash_ignore.append(p.encode("utf-8"))
-        self.state = StateCache(args.state, hash_ignore=hash_ignore)
+        self.state = StateCache(args.state, hash_ignore=hash_ignore,
+                                hash_scope=getattr(args, "lastmod_hash_scope", None) or "main")
         self.today = datetime.now(timezone.utc).date().isoformat()
 
         self.included: dict[str, str | None] = {}   # url -> lastmod (or None)
@@ -589,7 +694,10 @@ class Crawler:
         elif not same_scope(canonical, self.root_host, self.args.include_subdomains):
             self._skip("out-of-scope-canonical")
         else:
-            self._include(canonical, res)
+            declared = None
+            if not getattr(self.args, "no_declared_lastmod", False):
+                declared = declared_modified(html, canonical, p.modified_meta, self.today)
+            self._include(canonical, res, declared)
 
         # Record every outbound link for the reports (internal vs external),
         # independent of whether we will crawl it, then apply crawl rules.
@@ -621,10 +729,11 @@ class Crawler:
         else:
             self.external_edges.add((source, target))
 
-    def _include(self, url: str, res: FetchResult) -> None:
+    def _include(self, url: str, res: FetchResult, declared: str | None = None) -> None:
         if url in self.included:
             return
-        lastmod = self.state.lastmod_for(url, res.body, res.last_modified, self.today)
+        lastmod = self.state.lastmod_for(url, res.body, res.last_modified, self.today,
+                                         declared)
         self.included[url] = lastmod
         log.debug("include %s (lastmod=%s)", url, lastmod)
 
@@ -919,6 +1028,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "content hash used for lastmod, so per-request tokens don't "
                         "flip the date. Cloudflare challenge tokens and CSP nonces "
                         "are already stripped by default.")
+    p.add_argument("--no-declared-lastmod", action="store_true",
+                   help="Ignore each page's own declared date (JSON-LD dateModified "
+                        "on the node whose url/@id is that page, or "
+                        "<meta property=\"article:modified_time\">) and use only "
+                        "Last-Modified / the content hash. Use it when your pages' "
+                        "dateModified isn't trustworthy (e.g. set to the build time)")
+    p.add_argument("--lastmod-hash-scope", choices=HASH_SCOPES, default="main",
+                   help="What the lastmod content hash covers: 'main' (default) "
+                        "hashes only the page's <main> element when it has one, so "
+                        "site-wide header/nav/footer edits don't re-date every URL; "
+                        "'body' hashes the whole page (1.x behaviour). Switching "
+                        "keeps stored dates")
     p.add_argument("--gzip", action="store_true", help="Write gzipped sitemap(s)")
     p.add_argument("--public-path", default="",
                    help="URL path prefix where shards will be hosted, for the "
@@ -946,7 +1067,7 @@ def apply_config(args, parser) -> None:
     sec = cp["sitemapper"]
     bools = {"include_subdomains", "include_docs", "ignore_query", "render_js",
              "gzip", "respect_robots", "no_strip_params", "report_crawlable_only",
-             "omit_lastmod"}
+             "omit_lastmod", "no_declared_lastmod"}
     ints = {"max_pages", "max_depth", "max_bytes", "progress"}
     floats = {"timeout", "delay"}
     for key in sec:
@@ -961,6 +1082,8 @@ def apply_config(args, parser) -> None:
             setattr(args, attr, sec.getfloat(key))
         else:
             setattr(args, attr, sec.get(key))
+    if getattr(args, "lastmod_hash_scope", "main") not in HASH_SCOPES:
+        parser.error("lastmod_hash_scope must be one of: %s" % ", ".join(HASH_SCOPES))
     if not args.url and sec.get("url"):
         args.url = sec.get("url")
 
@@ -988,6 +1111,10 @@ def cron_line(args) -> str:
         cmd += ["--indexnow", args.indexnow]
     if args.gzip:
         cmd += ["--gzip"]
+    if getattr(args, "no_declared_lastmod", False):
+        cmd += ["--no-declared-lastmod"]
+    if getattr(args, "lastmod_hash_scope", "main") not in (None, "main"):
+        cmd += ["--lastmod-hash-scope", args.lastmod_hash_scope]
     quoted = " ".join(shlex.quote(c) for c in cmd)
     return "%s %s >> /var/log/sitemapper.log 2>&1" % (
         CRON_SCHEDULES[args.print_cron], quoted)

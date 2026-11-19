@@ -38,7 +38,10 @@ PAGES = {
         <a href="/nofollow-target" rel="nofollow">NF</a>
         <a href="/missing">Broken</a>
         </body></html>"""),
-    "/about": (200, "text/html", {}, "<html><body>About us</body></html>"),
+    "/about": (200, "text/html", {},
+               '<html><head><script type="application/ld+json">'
+               '{"@type":"WebPage","url":"/about","dateModified":"2020-05-06T10:00:00-06:00"}'
+               "</script></head><body>About us</body></html>"),
     "/page1.html": (200, "text/html", {}, "<html><body>Page one</body></html>"),
     "/noindex": (200, "text/html",
                  {"X-Robots-Tag": "noindex"},
@@ -170,6 +173,16 @@ class CrawlTests(unittest.TestCase):
     def test_nofollow_link_not_crawled(self):
         _, paths = self.crawl()
         self.assertNotIn("/nofollow-target", paths)
+
+    def test_declared_lastmod_on_by_default(self):
+        c, _ = self.crawl()
+        self.assertEqual(c.included[self.base + "/about"], "2020-05-06")
+        # pages that declare nothing still fall back to the content hash
+        self.assertEqual(c.included[self.base + "/page1.html"], c.today)
+
+    def test_no_declared_lastmod_flag_ignores_page_date(self):
+        c, _ = self.crawl(no_declared_lastmod=True)
+        self.assertEqual(c.included[self.base + "/about"], c.today)
 
 
 class UnitTests(unittest.TestCase):
@@ -311,6 +324,45 @@ class FeatureTests(unittest.TestCase):
         self.assertIn("--state", line)
         self.assertIn("--indexnow", line)
         self.assertIn(">> /var/log/sitemapper.log 2>&1", line)
+        self.assertNotIn("--no-declared-lastmod", line)
+        self.assertNotIn("--lastmod-hash-scope", line)
+
+    def test_cron_line_keeps_lastmod_opt_outs(self):
+        ns = types.SimpleNamespace(
+            url="https://e.com", output=None, state="/var/lib/e.json", indexnow=None,
+            gzip=False, print_cron="daily", no_declared_lastmod=True, lastmod_hash_scope="body")
+        line = sitemapper.cron_line(ns)
+        self.assertIn("--no-declared-lastmod", line)
+        self.assertIn("--lastmod-hash-scope body", line)
+
+    def test_config_file_sets_lastmod_options(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            ini = os.path.join(d, "c.ini")
+            with open(ini, "w") as fh:
+                fh.write("[sitemapper]\nurl = https://e.com\nno_declared_lastmod = true\n"
+                         "lastmod_hash_scope = body\n")
+            parser = sitemapper.build_parser()
+            args = parser.parse_args(["--config", ini])
+            sitemapper.apply_config(args, parser)
+        self.assertTrue(args.no_declared_lastmod)
+        self.assertEqual(args.lastmod_hash_scope, "body")
+
+    def test_cli_defaults_for_lastmod(self):
+        args = sitemapper.build_parser().parse_args(["https://e.com"])
+        self.assertFalse(args.no_declared_lastmod)
+        self.assertEqual(args.lastmod_hash_scope, "main")
+
+    def test_config_file_rejects_bad_hash_scope(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            ini = os.path.join(d, "c.ini")
+            with open(ini, "w") as fh:
+                fh.write("[sitemapper]\nurl = https://e.com\nlastmod_hash_scope = mian\n")
+            parser = sitemapper.build_parser()
+            args = parser.parse_args(["--config", ini])
+            with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                sitemapper.apply_config(args, parser)
 
     def test_hash_ignores_cloudflare_and_nonce(self):
         sc = sitemapper.StateCache(None, hash_ignore=sitemapper.DEFAULT_HASH_IGNORE)
@@ -382,6 +434,92 @@ class FeatureTests(unittest.TestCase):
         # new content -> today's date + flagged changed
         self.assertEqual(sc.lastmod_for("v", b"y", None, "2026-09-08"), "2026-09-08")
         self.assertIn("v", sc.changed)
+
+    def test_declared_date_beats_hash_and_header(self):
+        sc = sitemapper.StateCache(None)
+        sc.lastmod_for("u", b"<main>a</main>", None, "2026-09-01", declared="2004-10-09")
+        sc.changed.clear()
+        hdr = sitemapper.parsedate_to_datetime("Tue, 17 Nov 2026 02:00:00 GMT")
+        d = sc.lastmod_for("u", b"<main>a</main><footer>new</footer>", hdr,
+                           "2026-11-17", declared="2004-10-09")
+        self.assertEqual(d, "2004-10-09")
+        self.assertNotIn("u", sc.changed)
+
+    def test_declared_date_moving_backwards_is_not_a_change(self):
+        # Correcting an inflated lastmod must not re-submit the URL to IndexNow.
+        sc = sitemapper.StateCache(None)
+        sc.data = {"u": {"hash": "old", "lastmod": "2026-11-17"}}
+        self.assertEqual(sc.lastmod_for("u", b"x", None, "2026-11-19",
+                                        declared="2004-10-09"), "2004-10-09")
+        self.assertNotIn("u", sc.changed)
+        self.assertEqual(sc.lastmod_for("u", b"x", None, "2026-11-20",
+                                        declared="2026-11-20"), "2026-11-20")
+        self.assertIn("u", sc.changed)
+
+    def test_body_scope_hashes_whole_page_like_1x(self):
+        # --lastmod-hash-scope body keeps the 1.x behaviour and state format.
+        sc = sitemapper.StateCache(None, hash_scope="body")
+        sc.lastmod_for("u", b"<nav>a</nav><main>b</main>", None, "2026-01-01")
+        self.assertEqual(sc.data["u"], {"hash": hashlib.sha256(b"<nav>a</nav><main>b</main>").hexdigest(),
+                                        "lastmod": "2026-01-01"})
+        sc.changed.clear()
+        self.assertEqual(sc.lastmod_for("u", b"<nav>a2</nav><main>b</main>", None, "2026-11-17"),
+                         "2026-11-17")
+        self.assertIn("u", sc.changed)
+
+    def test_main_scope_ignores_template_edit(self):
+        sc = sitemapper.StateCache(None)
+        sc.lastmod_for("u", b"<nav>a</nav><main><p>body</p></main>", None, "2026-01-01")
+        sc.changed.clear()
+        d = sc.lastmod_for("u", b"<nav>a <a href=/search/>Search</a></nav>"
+                                b"<main><p>body</p></main>", None, "2026-11-17")
+        self.assertEqual(d, "2026-01-01")
+        self.assertNotIn("u", sc.changed)
+        d = sc.lastmod_for("u", b"<nav>a</nav><main><p>edited</p></main>", None, "2026-11-18")
+        self.assertEqual(d, "2026-11-18")
+        self.assertIn("u", sc.changed)
+
+    def test_main_scope_without_main_hashes_whole_body(self):
+        sc = sitemapper.StateCache(None, hash_scope="main")
+        sc.lastmod_for("u", b"<p>one</p>", None, "2026-01-01")
+        sc.changed.clear()
+        self.assertEqual(sc.lastmod_for("u", b"<p>two</p>", None, "2026-02-02"), "2026-02-02")
+
+    def test_hash_scope_switch_keeps_date(self):
+        sc = sitemapper.StateCache(None, hash_scope="main")
+        sc.data = {"u": {"hash": "whole-body-digest", "lastmod": "2026-01-01"}}
+        self.assertEqual(sc.lastmod_for("u", b"<main>x</main>", None, "2026-11-19"),
+                         "2026-01-01")
+        self.assertNotIn("u", sc.changed)
+        self.assertEqual(sc.data["u"]["scope"], "main")
+        # and back again
+        back = sitemapper.StateCache(None, hash_scope="body")
+        back.data = dict(sc.data)
+        self.assertEqual(back.lastmod_for("u", b"<main>x</main>", None, "2026-11-20"),
+                         "2026-01-01")
+        self.assertNotIn("u", back.changed)
+        self.assertNotIn("scope", back.data["u"])
+
+    def test_declared_modified_uses_only_this_pages_node(self):
+        html = ('<meta property="article:modified_time" content="2026-03-03T10:00:00-07:00">'
+                '<script type="application/ld+json">{"@graph":['
+                '{"@type":"Person","url":"https://e.com/","dateModified":"2026-11-16T19:20:47-07:00"},'
+                '{"@type":"Article","@id":"https://e.com/g/#article","dateModified":"2026-10-08T15:53:39-06:00"},'
+                '{"@type":"ImageObject","url":"https://e.com/g/a.jpg","dateModified":"2026-12-01"}'
+                ']}</script>')
+        self.assertEqual(sitemapper.declared_modified(html, "https://e.com/g/", None, "2026-11-19"),
+                         "2026-10-08")
+        # no matching JSON-LD node -> article:modified_time
+        self.assertEqual(sitemapper.declared_modified(html, "https://e.com/other/", "2026-03-03T10:00:00-07:00",
+                                                      "2026-11-19"), "2026-03-03")
+        # malformed JSON-LD is skipped, not fatal
+        self.assertIsNone(sitemapper.declared_modified(
+            '<script type="application/ld+json">{bad json</script>', "https://e.com/", None, "2026-11-19"))
+        # future and malformed dates are refused
+        self.assertIsNone(sitemapper._iso_date("2027-01-01", "2026-11-19"))
+        self.assertIsNone(sitemapper._iso_date("2026-02-30", "2026-11-19"))
+        self.assertIsNone(sitemapper._iso_date("yesterday", "2026-11-19"))
+        self.assertEqual(sitemapper._iso_date("2026-11-20T08:00:00+14:00", "2026-11-19"), "2026-11-20")
 
     def test_indexnow_payload(self):
         captured = {}

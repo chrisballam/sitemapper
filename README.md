@@ -20,10 +20,23 @@ and **excludes**:
 
 It also produces **honest `<lastmod>`**:
 
-- Uses the HTTP `Last-Modified` header when the server sends one.
+- **Prefers the page's own declared date**: the schema.org `dateModified` on the
+  JSON-LD node whose `url`/`@id` is that page (a site-wide `Person`/`WebSite`
+  node or an embedded `ImageObject` doesn't count), else
+  `<meta property="article:modified_time">`. Future-dated values are refused.
+  It is the most precise signal a site has, and it doesn't move when you edit
+  the header, nav or footer. A declared date counts as changed (for
+  `--indexnow`) only when it moves **forward**, so correcting inflated dates
+  downwards doesn't re-submit every URL. Pages that declare nothing fall
+  through to the rules below. If your pages' `dateModified` isn't trustworthy
+  (for example, a generator stamps the build time), pass `--no-declared-lastmod`.
+- Otherwise uses the HTTP `Last-Modified` header when the server sends one.
 - Otherwise, with a `--state` cache, it hashes each page's content and records the
   date the content **actually changed** across runs. On the very first run every
   page is stamped with today's date; real change-dates accrue as you re-run it.
+  Only the page's `<main>` element is hashed (pages without one are hashed
+  whole), so a site-wide template edit such as a new nav link doesn't re-date
+  every URL; `--lastmod-hash-scope body` hashes the whole page instead.
   Before hashing it removes `<script>` blocks, hidden form inputs (CSRF/timing
   tokens), and CSP `nonce`s, so per-request tokens (Cloudflare's rotating
   challenge token, New Relic's `NREUM.info`, GTM, a form's CSRF field, etc.) don't
@@ -99,6 +112,8 @@ the command can write to that directory.
 | `-o, --output PATH` | Output file (default `sitemap.xml`, or `sitemap_index.xml` when split) |
 | `--state PATH` | JSON cache enabling honest, per-URL `lastmod` across runs (recommended for cron) |
 | `--omit-lastmod` | Drop `<lastmod>` entirely (best for dynamic sites with per-request-varying HTML) |
+| `--no-declared-lastmod` | Ignore each page's JSON-LD `dateModified` / `article:modified_time` |
+| `--lastmod-hash-scope main\|body` | Content hash covers only `<main>` (default) or the whole page (1.x) |
 | `--include-subdomains` | Also crawl subdomains of the registrable domain |
 | `--no-docs` | HTML pages only; exclude PDFs (PDFs are included by default) |
 | `--report-dir DIR` | Also write `broken-links.csv`, `internal-links.csv`, `external-links.csv` |
@@ -291,6 +306,21 @@ examples are in `examples/crontab.txt`, and a systemd timer + service unit in
   real changes.
 - The sitemap is written atomically, so pointing `-o` at your live webroot is safe.
 - Redirect output to a log (`>> …log 2>&1`) so failures are visible.
+
+## Upgrading from 1.x
+
+2.0 changes two `lastmod` defaults: pages' own declared dates are preferred, and
+the content hash covers only `<main>`. Keep your existing `--state` file:
+
+- Stored dates are kept when the hash scope changes, so the upgrade itself
+  doesn't re-date anything or flood `--indexnow`.
+- On the first 2.0 run, `lastmod` moves to each page's declared date where one
+  exists. Dates that move backwards are not submitted to IndexNow; dates that
+  move forward are.
+- To keep 1.x behaviour exactly, run with `--no-declared-lastmod
+  --lastmod-hash-scope body`.
+- Going back to 1.x after a 2.0 run re-dates every URL once, because 1.x hashes
+  the whole page.
 
 ## Exit codes
 
